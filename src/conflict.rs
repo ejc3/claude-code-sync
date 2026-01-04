@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::merge;
@@ -347,6 +348,9 @@ impl ConflictDetector {
     }
 
     /// Compare local and remote sessions and detect conflicts
+    ///
+    /// Only reports TRUE conflicts where both sides have diverged.
+    /// Simple extensions (one side has more messages) are NOT conflicts.
     pub fn detect(
         &mut self,
         local_sessions: &[ConversationSession],
@@ -361,11 +365,43 @@ impl ConflictDetector {
         // Check each remote session against local
         for remote in remote_sessions {
             if let Some(local) = local_map.get(&remote.session_id) {
-                // Session exists in both - check for conflicts
-                if local.content_hash() != remote.content_hash() {
-                    let conflict = Conflict::new(local, remote);
-                    if conflict.is_real_conflict() {
+                // Session exists in both - analyze relationship
+                let relationship = analyze_session_relationship(local, remote);
+
+                match relationship {
+                    SessionRelationship::Identical => {
+                        // No action needed - sessions are the same
+                    }
+                    SessionRelationship::LocalIsPrefix => {
+                        // Remote has more messages - NOT a conflict
+                        // This will be handled as a normal "Modified" copy in pull
+                        log::debug!(
+                            "Session {} is extended in remote ({} -> {} entries)",
+                            local.session_id,
+                            local.entries.len(),
+                            remote.entries.len()
+                        );
+                    }
+                    SessionRelationship::RemoteIsPrefix => {
+                        // Local has more messages - NOT a conflict
+                        // Keep local, no action needed during pull
+                        log::debug!(
+                            "Session {} is extended locally ({} -> {} entries), keeping local",
+                            local.session_id,
+                            remote.entries.len(),
+                            local.entries.len()
+                        );
+                    }
+                    SessionRelationship::Diverged => {
+                        // TRUE conflict - both have unique entries
+                        let conflict = Conflict::new(local, remote);
                         self.conflicts.push(conflict);
+                        log::info!(
+                            "True conflict detected in session {} (local: {}, remote: {} entries)",
+                            local.session_id,
+                            local.entries.len(),
+                            remote.entries.len()
+                        );
                     }
                 }
             }
@@ -415,6 +451,110 @@ impl Default for ConflictDetector {
     }
 }
 
+/// Relationship between two sessions with the same ID
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRelationship {
+    /// Sessions are identical (same content hash)
+    Identical,
+    /// Local is a prefix of remote (remote has more messages, all local messages exist in remote)
+    LocalIsPrefix,
+    /// Remote is a prefix of local (local has more messages, all remote messages exist in local)
+    RemoteIsPrefix,
+    /// True divergence - both have unique messages not in the other (actual conflict)
+    Diverged,
+}
+
+/// Analyzes the relationship between two sessions to determine if they truly conflict
+/// or if one is simply an extension of the other.
+///
+/// This is crucial for avoiding false "conflicts" when:
+/// - Machine A has session with 40 messages
+/// - Machine B has the same session with 50 messages (continued the conversation)
+/// - This is NOT a conflict - Machine B just has more messages
+///
+/// True conflicts only occur when BOTH sides have added different messages.
+pub fn analyze_session_relationship(
+    local: &ConversationSession,
+    remote: &ConversationSession,
+) -> SessionRelationship {
+    // Fast path: identical hashes
+    if local.content_hash() == remote.content_hash() {
+        return SessionRelationship::Identical;
+    }
+
+    // Build sets of UUIDs from each session
+    let local_uuids: HashSet<String> = local
+        .entries
+        .iter()
+        .filter_map(|e| e.uuid.clone())
+        .collect();
+
+    let remote_uuids: HashSet<String> = remote
+        .entries
+        .iter()
+        .filter_map(|e| e.uuid.clone())
+        .collect();
+
+    // Check for entries unique to each side
+    let local_only: HashSet<_> = local_uuids.difference(&remote_uuids).collect();
+    let remote_only: HashSet<_> = remote_uuids.difference(&local_uuids).collect();
+
+    // If local has no unique entries, local is a prefix of remote
+    if local_only.is_empty() && !remote_only.is_empty() {
+        // Verify common entries are identical
+        if verify_common_entries_identical(local, remote) {
+            return SessionRelationship::LocalIsPrefix;
+        }
+    }
+
+    // If remote has no unique entries, remote is a prefix of local
+    if remote_only.is_empty() && !local_only.is_empty() {
+        // Verify common entries are identical
+        if verify_common_entries_identical(local, remote) {
+            return SessionRelationship::RemoteIsPrefix;
+        }
+    }
+
+    // Both have unique entries - true divergence
+    SessionRelationship::Diverged
+}
+
+/// Verifies that entries with the same UUID have identical content
+fn verify_common_entries_identical(
+    local: &ConversationSession,
+    remote: &ConversationSession,
+) -> bool {
+    use std::collections::HashMap;
+
+    // Build map of UUID -> serialized entry for local
+    let local_map: HashMap<String, String> = local
+        .entries
+        .iter()
+        .filter_map(|e| {
+            e.uuid.as_ref().and_then(|uuid| {
+                serde_json::to_string(e).ok().map(|json| (uuid.clone(), json))
+            })
+        })
+        .collect();
+
+    // Check each remote entry with a UUID
+    for entry in &remote.entries {
+        if let Some(uuid) = &entry.uuid {
+            if let Some(local_json) = local_map.get(uuid) {
+                // This UUID exists in both - check if content is identical
+                if let Ok(remote_json) = serde_json::to_string(entry) {
+                    if &remote_json != local_json {
+                        // Same UUID but different content - entries were modified
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,21 +589,142 @@ mod tests {
         }
     }
 
+    /// Creates a diverged session where both sides have unique messages
+    fn create_diverged_sessions(session_id: &str) -> (ConversationSession, ConversationSession) {
+        // Common base: messages 0-4
+        let mut local_entries = Vec::new();
+        let mut remote_entries = Vec::new();
+
+        for i in 0..5 {
+            let entry = ConversationEntry {
+                entry_type: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                uuid: Some(format!("uuid-{i}")),
+                parent_uuid: if i > 0 {
+                    Some(format!("uuid-{}", i - 1))
+                } else {
+                    None
+                },
+                session_id: Some(session_id.to_string()),
+                timestamp: Some(format!("2025-01-01T{i:02}:00:00Z")),
+                message: None,
+                cwd: None,
+                version: None,
+                git_branch: None,
+                extra: serde_json::Value::Null,
+            };
+            local_entries.push(entry.clone());
+            remote_entries.push(entry);
+        }
+
+        // Local adds message 5-local (unique to local)
+        local_entries.push(ConversationEntry {
+            entry_type: "user".to_string(),
+            uuid: Some("uuid-5-local".to_string()),
+            parent_uuid: Some("uuid-4".to_string()),
+            session_id: Some(session_id.to_string()),
+            timestamp: Some("2025-01-01T05:00:00Z".to_string()),
+            message: None,
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        });
+
+        // Remote adds message 5-remote (unique to remote)
+        remote_entries.push(ConversationEntry {
+            entry_type: "user".to_string(),
+            uuid: Some("uuid-5-remote".to_string()),
+            parent_uuid: Some("uuid-4".to_string()),
+            session_id: Some(session_id.to_string()),
+            timestamp: Some("2025-01-01T05:30:00Z".to_string()),
+            message: None,
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        });
+
+        let local = ConversationSession {
+            session_id: session_id.to_string(),
+            entries: local_entries,
+            file_path: format!("/test/{session_id}.jsonl"),
+        };
+
+        let remote = ConversationSession {
+            session_id: session_id.to_string(),
+            entries: remote_entries,
+            file_path: format!("/sync/{session_id}.jsonl"),
+        };
+
+        (local, remote)
+    }
+
     #[test]
-    fn test_conflict_detection() {
-        let local_session = create_test_session("session-1", 5);
-        let remote_session = create_test_session("session-1", 6);
+    fn test_session_relationship_identical() {
+        let local = create_test_session("session-1", 5);
+        let remote = create_test_session("session-1", 5);
+
+        let relationship = analyze_session_relationship(&local, &remote);
+        assert_eq!(relationship, SessionRelationship::Identical);
+    }
+
+    #[test]
+    fn test_session_relationship_local_is_prefix() {
+        // Local has 5 messages, remote has 10 (same first 5)
+        let local = create_test_session("session-1", 5);
+        let remote = create_test_session("session-1", 10);
+
+        let relationship = analyze_session_relationship(&local, &remote);
+        assert_eq!(relationship, SessionRelationship::LocalIsPrefix);
+    }
+
+    #[test]
+    fn test_session_relationship_remote_is_prefix() {
+        // Local has 10 messages, remote has 5 (same first 5)
+        let local = create_test_session("session-1", 10);
+        let remote = create_test_session("session-1", 5);
+
+        let relationship = analyze_session_relationship(&local, &remote);
+        assert_eq!(relationship, SessionRelationship::RemoteIsPrefix);
+    }
+
+    #[test]
+    fn test_session_relationship_diverged() {
+        let (local, remote) = create_diverged_sessions("session-1");
+
+        let relationship = analyze_session_relationship(&local, &remote);
+        assert_eq!(relationship, SessionRelationship::Diverged);
+    }
+
+    #[test]
+    fn test_conflict_detection_only_diverged() {
+        // This is the KEY test: extensions should NOT be conflicts
+        let local_5 = create_test_session("session-ext", 5);
+        let remote_10 = create_test_session("session-ext", 10);
 
         let mut detector = ConflictDetector::new();
-        detector.detect(&[local_session], &[remote_session]);
+        detector.detect(&[local_5], &[remote_10]);
 
-        assert!(detector.has_conflicts());
+        // Extension should NOT create a conflict
+        assert!(
+            !detector.has_conflicts(),
+            "Extension (local prefix of remote) should NOT be a conflict"
+        );
+    }
+
+    #[test]
+    fn test_conflict_detection_diverged_creates_conflict() {
+        let (local, remote) = create_diverged_sessions("session-div");
+
+        let mut detector = ConflictDetector::new();
+        detector.detect(&[local], &[remote]);
+
+        // True divergence SHOULD create a conflict
+        assert!(
+            detector.has_conflicts(),
+            "Diverged sessions SHOULD be a conflict"
+        );
         assert_eq!(detector.conflict_count(), 1);
-
-        let conflict = &detector.conflicts()[0];
-        assert_eq!(conflict.session_id, "session-1");
-        assert_eq!(conflict.local_message_count, 5);
-        assert_eq!(conflict.remote_message_count, 6);
     }
 
     #[test]
