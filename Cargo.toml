@@ -22,6 +22,7 @@ inquire = "0.9.1"
 log = "0.4.28"
 env_logger = "0.11.8"
 atty = "0.2.14"
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3.23.0"
