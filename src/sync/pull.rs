@@ -51,6 +51,14 @@ pub fn pull_history(
     let filter = FilterConfig::load()?;
     let claude_dir = claude_projects_dir()?;
 
+    // Clean up old temp branches that have exceeded retention period
+    cleanup_old_temp_branches(
+        repo.as_ref(),
+        fetch_remote && state.has_remote,
+        filter.temp_branch_retention_hours,
+        verbosity,
+    )?;
+
     // Get the main branch name
     let main_branch = branch
         .map(|s| s.to_string())
@@ -244,8 +252,8 @@ pub fn pull_history(
             .context("Failed to get confirmation")?;
 
         if !confirm {
-            // Clean up temp branch before exiting
-            cleanup_temp_branch(repo.as_ref(), &temp_branch, fetch_remote && state.has_remote, verbosity)?;
+            // Clean up temp branch before exiting (force=true to delete even with retention)
+            cleanup_temp_branch(repo.as_ref(), &temp_branch, fetch_remote && state.has_remote, verbosity, 0, true)?;
             println!("\n{}", "Pull cancelled.".yellow());
             return Ok(());
         }
@@ -516,9 +524,16 @@ pub fn pull_history(
     }
 
     // ============================================================================
-    // STEP 7: Clean up temp branch
+    // STEP 7: Clean up temp branch (respects retention config)
     // ============================================================================
-    cleanup_temp_branch(repo.as_ref(), &temp_branch, fetch_remote && state.has_remote, verbosity)?;
+    cleanup_temp_branch(
+        repo.as_ref(),
+        &temp_branch,
+        fetch_remote && state.has_remote,
+        verbosity,
+        filter.temp_branch_retention_hours,
+        false, // don't force delete
+    )?;
 
     // ============================================================================
     // CREATE AND SAVE OPERATION RECORD
@@ -629,13 +644,31 @@ pub fn pull_history(
 }
 
 /// Clean up the temporary branch (local and optionally remote)
+///
+/// If retention_hours > 0, skip deletion (branch will be cleaned up later).
+/// If force is true, always delete (used when pull is cancelled).
 fn cleanup_temp_branch(
     repo: &dyn scm::Scm,
     temp_branch: &str,
     has_remote: bool,
     verbosity: crate::VerbosityLevel,
+    retention_hours: u32,
+    force: bool,
 ) -> Result<()> {
     use crate::VerbosityLevel;
+
+    // Skip cleanup if retention is enabled and this isn't a forced cleanup
+    if retention_hours > 0 && !force {
+        if verbosity != VerbosityLevel::Quiet {
+            println!(
+                "  {} Temp branch {} retained for {} hours",
+                "ℹ".cyan(),
+                temp_branch,
+                retention_hours
+            );
+        }
+        return Ok(());
+    }
 
     if verbosity != VerbosityLevel::Quiet {
         println!("  {} temp branch...", "Cleaning up".cyan());
@@ -665,6 +698,81 @@ fn cleanup_temp_branch(
         Err(e) => {
             log::warn!("Failed to delete local branch: {}", e);
         }
+    }
+
+    Ok(())
+}
+
+/// Clean up old temporary branches that have exceeded their retention period
+fn cleanup_old_temp_branches(
+    repo: &dyn scm::Scm,
+    has_remote: bool,
+    retention_hours: u32,
+    verbosity: crate::VerbosityLevel,
+) -> Result<()> {
+    use crate::VerbosityLevel;
+
+    // If retention is 0, branches are deleted immediately so nothing to clean up
+    if retention_hours == 0 {
+        return Ok(());
+    }
+
+    // Get list of local branches matching our temp branch pattern
+    let branches = match repo.list_branches() {
+        Ok(b) => b,
+        Err(e) => {
+            log::debug!("Failed to list branches for cleanup: {}", e);
+            return Ok(());
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let retention_duration = chrono::Duration::hours(retention_hours as i64);
+    let mut cleaned = 0;
+
+    for branch in branches {
+        // Only process our temp branches (format: sync-local-YYYYMMDD-HHMMSS)
+        if !branch.starts_with("sync-local-") {
+            continue;
+        }
+
+        // Parse timestamp from branch name
+        let timestamp_part = branch.strip_prefix("sync-local-").unwrap_or(&branch);
+        if let Ok(branch_time) = chrono::NaiveDateTime::parse_from_str(timestamp_part, "%Y%m%d-%H%M%S")
+        {
+            let branch_time_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                branch_time,
+                chrono::Utc,
+            );
+
+            // Check if branch has exceeded retention period
+            if now.signed_duration_since(branch_time_utc) > retention_duration {
+                log::debug!("Cleaning up old temp branch: {}", branch);
+
+                // Delete remote branch first
+                if has_remote {
+                    if let Err(e) = repo.delete_remote_branch("origin", &branch) {
+                        log::debug!("Failed to delete remote branch {}: {}", branch, e);
+                    }
+                }
+
+                // Delete local branch
+                if let Err(e) = repo.delete_branch(&branch) {
+                    log::debug!("Failed to delete local branch {}: {}", branch, e);
+                } else {
+                    cleaned += 1;
+                }
+            }
+        }
+    }
+
+    if cleaned > 0 && verbosity != VerbosityLevel::Quiet {
+        println!(
+            "  {} Cleaned up {} old temp branch{}",
+            "✓".green(),
+            cleaned,
+            if cleaned == 1 { "" } else { "es" }
+        );
     }
 
     Ok(())

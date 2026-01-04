@@ -1,6 +1,6 @@
 //! Git SCM backend using CLI commands.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -242,6 +242,26 @@ impl Scm for GitScm {
 
     fn fetch(&self, remote: &str) -> Result<()> {
         self.run_git_ok(&["fetch", remote])
+    }
+
+    fn list_branches(&self) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args(["branch", "--format=%(refname:short)"])
+            .current_dir(&self.workdir)
+            .output()
+            .context("Failed to run git branch")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("git branch failed: {}", stderr);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
     }
 }
 

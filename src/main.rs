@@ -183,6 +183,10 @@ enum Commands {
         #[arg(long)]
         use_project_name_only: Option<bool>,
 
+        /// Hours to retain temp branches after pull (default: 24, 0 = delete immediately)
+        #[arg(long)]
+        temp_branch_retention: Option<u32>,
+
         /// Show current configuration
         #[arg(long)]
         show: bool,
@@ -484,6 +488,7 @@ fn main() -> Result<()> {
             scm_backend,
             sync_subdirectory,
             use_project_name_only,
+            temp_branch_retention,
             show,
             interactive,
             wizard,
@@ -521,6 +526,7 @@ fn main() -> Result<()> {
                     scm_backend,
                     sync_subdirectory,
                     use_project_name_only,
+                    temp_branch_retention,
                 )?;
             }
         }

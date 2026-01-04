@@ -111,6 +111,9 @@ pub trait Scm: Send + Sync {
 
     /// Fetch from a remote without merging.
     fn fetch(&self, remote: &str) -> Result<()>;
+
+    /// List all local branches.
+    fn list_branches(&self) -> Result<Vec<String>>;
 }
 
 /// Check if a directory is a repository (Git or Mercurial).

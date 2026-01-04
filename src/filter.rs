@@ -54,6 +54,11 @@ pub struct FilterConfig {
     /// when usernames or paths differ across machines.
     #[serde(default)]
     pub use_project_name_only: bool,
+
+    /// How long to keep temp branches after a pull operation, in hours (default: 24)
+    /// Set to 0 to delete temp branches immediately after merge
+    #[serde(default = "default_temp_branch_retention_hours")]
+    pub temp_branch_retention_hours: u32,
 }
 
 fn default_lfs_patterns() -> Vec<String> {
@@ -72,6 +77,10 @@ fn default_sync_subdirectory() -> String {
     "projects".to_string()
 }
 
+fn default_temp_branch_retention_hours() -> u32 {
+    24 // Keep temp branches for 24 hours by default
+}
+
 impl Default for FilterConfig {
     fn default() -> Self {
         FilterConfig {
@@ -85,6 +94,7 @@ impl Default for FilterConfig {
             scm_backend: default_scm_backend(),
             sync_subdirectory: default_sync_subdirectory(),
             use_project_name_only: false,
+            temp_branch_retention_hours: default_temp_branch_retention_hours(),
         }
     }
 }
@@ -252,6 +262,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// Update the filter configuration
+#[allow(clippy::too_many_arguments)]
 pub fn update_config(
     exclude_older_than: Option<u32>,
     include_projects: Option<String>,
@@ -262,6 +273,7 @@ pub fn update_config(
     scm_backend: Option<String>,
     sync_subdirectory: Option<String>,
     use_project_name_only: Option<bool>,
+    temp_branch_retention: Option<u32>,
 ) -> Result<()> {
     let mut config = FilterConfig::load()?;
 
@@ -365,6 +377,16 @@ pub fn update_config(
         );
     }
 
+    if let Some(hours) = temp_branch_retention {
+        config.temp_branch_retention_hours = hours;
+        let msg = if hours == 0 {
+            "Temp branches will be deleted immediately after merge".to_string()
+        } else {
+            format!("Temp branch retention set to {} hours", hours)
+        };
+        println!("{}", msg.green());
+    }
+
     // Validate configuration before saving
     config.validate()?;
 
@@ -447,6 +469,16 @@ pub fn show_config() -> Result<()> {
         } else {
             "No (full path mode)".yellow()
         }
+    );
+    println!(
+        "  {}: {}",
+        "Temp branch retention".cyan(),
+        if config.temp_branch_retention_hours == 0 {
+            "Delete immediately".to_string()
+        } else {
+            format!("{} hours", config.temp_branch_retention_hours)
+        }
+        .green()
     );
 
     Ok(())

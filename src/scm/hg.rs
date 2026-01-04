@@ -313,6 +313,19 @@ impl Scm for HgScm {
         self.run_hg(&["pull", remote])?;
         Ok(())
     }
+
+    fn list_branches(&self) -> Result<Vec<String>> {
+        // In Mercurial, we use bookmarks as branch equivalents
+        let output = self.run_hg(&["bookmark"])?;
+        Ok(output
+            .lines()
+            .filter_map(|line| {
+                // Format: "   name    revision:hash" or " * name    revision:hash"
+                let trimmed = line.trim_start_matches(['*', ' ']);
+                trimmed.split_whitespace().next().map(|s| s.to_string())
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
