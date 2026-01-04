@@ -1,32 +1,28 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use inquire::Confirm;
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 
 use crate::filter::FilterConfig;
-use crate::history::{
-    ConversationSummary, OperationHistory, OperationRecord, OperationType, SyncOperation,
-};
+use crate::history::{OperationHistory, OperationRecord, OperationType};
 use crate::interactive_conflict;
 use crate::scm;
 
-use super::discovery::{claude_projects_dir, discover_sessions};
 use super::state::SyncState;
-use super::MAX_CONVERSATIONS_TO_DISPLAY;
 
-/// Push local Claude Code history to sync repository
+/// Push sync repository to remote
 ///
-/// Simplified workflow:
-/// 1. Copy local .claude sessions to sync repo
-/// 2. Commit changes
+/// Simple workflow:
+/// 1. Stage any uncommitted changes in sync repo
+/// 2. Commit if there are changes
 /// 3. Push to remote (fail on conflict - user must pull first)
+///
+/// Note: Local ~/.claude sessions are captured during `pull`, not here.
+/// Push just pushes whatever is already in the sync repo.
 pub fn push_history(
     commit_message: Option<&str>,
     push_remote: bool,
     branch: Option<&str>,
-    exclude_attachments: bool,
+    _exclude_attachments: bool,
     interactive: bool,
     verbosity: crate::VerbosityLevel,
 ) -> Result<()> {
@@ -38,12 +34,7 @@ pub fn push_history(
 
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
-    let mut filter = FilterConfig::load()?;
-
-    // Override exclude_attachments if specified in command
-    if exclude_attachments {
-        filter.exclude_attachments = true;
-    }
+    let filter = FilterConfig::load()?;
 
     // Set up LFS if enabled
     if filter.enable_lfs {
@@ -54,137 +45,26 @@ pub fn push_history(
             .context("Failed to set up Git LFS")?;
     }
 
-    let claude_dir = claude_projects_dir()?;
-
-    // Get the current branch name for operation record
+    // Get the current branch name
     let branch_name = branch
         .map(|s| s.to_string())
         .or_else(|| repo.current_branch().ok())
         .unwrap_or_else(|| "main".to_string());
 
-    // Discover all sessions
-    println!("  {} conversation sessions...", "Discovering".cyan());
-    let sessions = discover_sessions(&claude_dir, &filter)?;
-    println!("  {} {} sessions", "Found".green(), sessions.len());
+    // Stage any uncommitted changes
+    repo.stage_all()?;
 
-    // ============================================================================
-    // COPY SESSIONS AND TRACK CHANGES
-    // ============================================================================
-    let projects_dir = state.sync_repo_path.join(&filter.sync_subdirectory);
-    fs::create_dir_all(&projects_dir)?;
-
-    // Discover existing sessions in sync repo to determine operation type
-    println!("  {} sessions to sync repository...", "Copying".cyan());
-    let existing_sessions = discover_sessions(&projects_dir, &filter)?;
-    let existing_map: HashMap<_, _> = existing_sessions
-        .iter()
-        .map(|s| (s.session_id.clone(), s))
-        .collect();
-
-    // Track pushed conversations for operation record
-    let mut pushed_conversations: Vec<ConversationSummary> = Vec::new();
-    let mut added_count = 0;
-    let mut modified_count = 0;
-    let mut unchanged_count = 0;
-
-    for session in &sessions {
-        let relative_path = Path::new(&session.file_path)
-            .strip_prefix(&claude_dir)
-            .unwrap_or(Path::new(&session.file_path));
-
-        let dest_path = projects_dir.join(relative_path);
-
-        // Determine operation type based on existing state
-        let operation = if let Some(existing) = existing_map.get(&session.session_id) {
-            if existing.content_hash() == session.content_hash() {
-                unchanged_count += 1;
-                SyncOperation::Unchanged
-            } else {
-                modified_count += 1;
-                SyncOperation::Modified
-            }
-        } else {
-            added_count += 1;
-            SyncOperation::Added
-        };
-
-        // Write the session file
-        session.write_to_file(&dest_path)?;
-
-        // Track this session in pushed conversations
-        let relative_path_str = relative_path.to_string_lossy().to_string();
-        match ConversationSummary::new(
-            session.session_id.clone(),
-            relative_path_str.clone(),
-            session.latest_timestamp(),
-            session.message_count(),
-            operation,
-        ) {
-            Ok(summary) => pushed_conversations.push(summary),
-            Err(e) => log::warn!(
-                "Failed to create summary for {}: {}",
-                relative_path_str,
-                e
-            ),
+    let has_changes = repo.has_changes()?;
+    if !has_changes {
+        if verbosity != VerbosityLevel::Quiet {
+            println!("  {} No changes to push", "✓".green());
         }
+        return Ok(());
     }
 
-    // ============================================================================
-    // SYNC HISTORY.JSONL (session index for --resume picker)
-    // ============================================================================
-    let claude_base_dir = claude_dir.parent().unwrap_or(&claude_dir);
-    let local_history = claude_base_dir.join("history.jsonl");
-    let sync_history = state.sync_repo_path.join("history.jsonl");
-
-    if local_history.exists() {
-        println!("  {} history.jsonl...", "Syncing".cyan());
-
-        // Merge local into sync repo (local entries take priority for push)
-        let (total, added) = super::history_merge::merge_history_files(
-            &local_history,
-            &sync_history,
-            super::history_merge::MergePriority::SourceFirst,
-        )?;
-        println!("  {} history.jsonl synced ({} entries, {} new)", "✓".green(), total, added);
-    }
-
-    // ============================================================================
-    // SHOW SUMMARY AND INTERACTIVE CONFIRMATION
-    // ============================================================================
+    // Show what will be committed
     if verbosity != VerbosityLevel::Quiet {
-        println!();
-        println!("{}", "Push Summary:".bold().cyan());
-        println!("  {} Added: {}", "•".green(), added_count);
-        println!("  {} Modified: {}", "•".yellow(), modified_count);
-        println!("  {} Unchanged: {}", "•".dimmed(), unchanged_count);
-        println!("  {} Total: {}", "•".cyan(), sessions.len());
-        println!();
-    }
-
-    // Show detailed file list in verbose mode
-    if verbosity == VerbosityLevel::Verbose {
-        println!("{}", "Files to be pushed:".bold());
-        for (idx, session) in sessions.iter().enumerate().take(20) {
-            let relative_path = Path::new(&session.file_path)
-                .strip_prefix(&claude_dir)
-                .unwrap_or(Path::new(&session.file_path));
-
-            let status = if let Some(existing) = existing_map.get(&session.session_id) {
-                if existing.content_hash() == session.content_hash() {
-                    "unchanged".dimmed()
-                } else {
-                    "modified".yellow()
-                }
-            } else {
-                "new".green()
-            };
-
-            println!("  {}. {} [{}]", idx + 1, relative_path.display(), status);
-        }
-        if sessions.len() > 20 {
-            println!("  ... and {} more", sessions.len() - 20);
-        }
-        println!();
+        println!("  {} Changes staged for commit", "✓".green());
     }
 
     // Interactive confirmation
@@ -201,178 +81,80 @@ pub fn push_history(
         }
     }
 
-    // ============================================================================
-    // COMMIT AND PUSH CHANGES
-    // ============================================================================
-    repo.stage_all()?;
+    // Get the current commit hash before making changes (may not exist for empty repos)
+    let commit_before_push = repo.current_commit_hash().ok();
 
-    let has_changes = repo.has_changes()?;
-    if has_changes {
-        // Get the current commit hash before making any changes (may not exist for empty repos)
-        let commit_before_push = repo.current_commit_hash().ok();
+    // Commit
+    let default_message = format!(
+        "Sync at {}",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    let message = commit_message.unwrap_or(&default_message);
 
-        if let Some(ref hash) = commit_before_push {
-            if verbosity != VerbosityLevel::Quiet {
-                println!(
-                    "  {} Recorded commit {}",
-                    "✓".green(),
-                    &hash[..8.min(hash.len())]
-                );
-            }
+    if verbosity != VerbosityLevel::Quiet {
+        println!("  {} changes...", "Committing".cyan());
+    }
+    repo.commit(message)?;
+    if verbosity != VerbosityLevel::Quiet {
+        println!("  {} Committed: {}", "✓".green(), message);
+    }
+
+    // Push to remote if configured
+    if push_remote && state.has_remote {
+        if verbosity != VerbosityLevel::Quiet {
+            println!("  {} to remote...", "Pushing".cyan());
         }
 
-        let default_message = format!(
-            "Sync {} sessions at {}",
-            sessions.len(),
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-        );
-        let message = commit_message.unwrap_or(&default_message);
-
-        println!("  {} changes...", "Committing".cyan());
-        repo.commit(message)?;
-        println!("  {} Committed: {}", "✓".green(), message);
-
-        // Push to remote if configured - simple push, fail on conflict
-        if push_remote && state.has_remote {
-            println!("  {} to remote...", "Pushing".cyan());
-
-            match repo.push("origin", &branch_name) {
-                Ok(_) => println!("  {} Pushed to origin/{}", "✓".green(), branch_name),
-                Err(e) => {
-                    // Check if this is a conflict (non-fast-forward)
-                    let error_msg = e.to_string();
-                    if error_msg.contains("non-fast-forward")
-                        || error_msg.contains("fetch first")
-                        || error_msg.contains("rejected")
-                        || error_msg.contains("failed to push")
-                    {
-                        println!(
-                            "\n{} Remote has changes that aren't in your local repository.",
-                            "!".yellow().bold()
-                        );
-                        println!(
-                            "{} Run {} first to merge remote changes, then push again.",
-                            "→".cyan(),
-                            "claude-code-sync pull".bold()
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Push rejected: remote has new commits. Run 'claude-code-sync pull' first."
-                        ));
-                    } else {
-                        // Some other error
-                        return Err(e.context("Failed to push to remote"));
-                    }
+        match repo.push("origin", &branch_name) {
+            Ok(_) => {
+                if verbosity != VerbosityLevel::Quiet {
+                    println!("  {} Pushed to origin/{}", "✓".green(), branch_name);
+                }
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("non-fast-forward")
+                    || error_msg.contains("fetch first")
+                    || error_msg.contains("rejected")
+                    || error_msg.contains("failed to push")
+                {
+                    println!(
+                        "\n{} Remote has changes that aren't in your local repository.",
+                        "!".yellow().bold()
+                    );
+                    println!(
+                        "{} Run {} first to merge remote changes, then push again.",
+                        "→".cyan(),
+                        "claude-code-sync pull".bold()
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Push rejected: remote has new commits. Run 'claude-code-sync pull' first."
+                    ));
+                } else {
+                    return Err(e.context("Failed to push to remote"));
                 }
             }
         }
-
-        // ============================================================================
-        // CREATE AND SAVE OPERATION RECORD
-        // ============================================================================
-        let mut operation_record = OperationRecord::new(
-            OperationType::Push,
-            Some(branch_name.clone()),
-            pushed_conversations.clone(),
-        );
-
-        // Store commit hash for reference (if we had a previous commit)
-        operation_record.commit_hash = commit_before_push;
-
-        // Load operation history and add this operation
-        let mut history = match OperationHistory::load() {
-            Ok(h) => h,
-            Err(e) => {
-                log::warn!("Failed to load operation history: {}", e);
-                log::info!("Creating new history...");
-                OperationHistory::default()
-            }
-        };
-
-        if let Err(e) = history.add_operation(operation_record) {
-            log::warn!("Failed to save operation to history: {}", e);
-            log::info!("Push completed successfully, but history was not updated.");
-        }
-    } else {
-        println!("  {} No changes to commit", "Note:".yellow());
     }
 
-    // ============================================================================
-    // DISPLAY SUMMARY TO USER
-    // ============================================================================
-    println!("\n{}", "=== Push Summary ===".bold().cyan());
-
-    // Show operation statistics
-    let stats_msg = format!(
-        "  {} Added    {} Modified    {} Unchanged",
-        format!("{added_count}").green(),
-        format!("{modified_count}").cyan(),
-        format!("{unchanged_count}").dimmed(),
+    // Record operation in history
+    let mut operation_record = OperationRecord::new(
+        OperationType::Push,
+        Some(branch_name.clone()),
+        Vec::new(), // No detailed conversation tracking in simplified push
     );
-    println!("{stats_msg}");
-    println!();
+    operation_record.commit_hash = commit_before_push;
 
-    // Group conversations by project (top-level directory)
-    let mut by_project: HashMap<String, Vec<&ConversationSummary>> = HashMap::new();
-    for conv in &pushed_conversations {
-        // Skip unchanged conversations in detailed output
-        if conv.operation == SyncOperation::Unchanged {
-            continue;
+    let mut history = match OperationHistory::load() {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("Failed to load operation history: {}", e);
+            OperationHistory::default()
         }
+    };
 
-        let project = conv
-            .project_path
-            .split('/')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
-        by_project.entry(project).or_default().push(conv);
-    }
-
-    // Display conversations grouped by project
-    if !by_project.is_empty() {
-        println!("{}", "Pushed Conversations:".bold());
-
-        let mut projects: Vec<_> = by_project.keys().collect();
-        projects.sort();
-
-        for project in projects {
-            let conversations = &by_project[project];
-            println!("\n  {} {}/", "Project:".bold(), project.cyan());
-
-            for conv in conversations.iter().take(MAX_CONVERSATIONS_TO_DISPLAY) {
-                let operation_str = match conv.operation {
-                    SyncOperation::Added => "ADD".green(),
-                    SyncOperation::Modified => "MOD".cyan(),
-                    SyncOperation::Conflict => "CONFLICT".yellow(),
-                    SyncOperation::Unchanged => "---".dimmed(),
-                };
-
-                let timestamp_str = conv
-                    .timestamp
-                    .as_ref()
-                    .and_then(|t| {
-                        // Extract just the date portion for compact display
-                        t.split('T').next()
-                    })
-                    .unwrap_or("unknown");
-
-                println!(
-                    "    {} {} ({}msg, {})",
-                    operation_str,
-                    conv.project_path,
-                    conv.message_count,
-                    timestamp_str.dimmed()
-                );
-            }
-
-            if conversations.len() > MAX_CONVERSATIONS_TO_DISPLAY {
-                println!(
-                    "    {} ... and {} more conversations",
-                    "...".dimmed(),
-                    conversations.len() - MAX_CONVERSATIONS_TO_DISPLAY
-                );
-            }
-        }
+    if let Err(e) = history.add_operation(operation_record) {
+        log::warn!("Failed to save operation to history: {}", e);
     }
 
     if verbosity == VerbosityLevel::Quiet {
