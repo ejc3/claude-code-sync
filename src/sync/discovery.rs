@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -39,32 +40,37 @@ fn expand_tilde(path: &str) -> Result<PathBuf> {
 }
 
 /// Discover all conversation sessions in Claude Code history
+///
+/// Uses parallel processing via rayon to parse multiple JSONL files concurrently,
+/// significantly speeding up discovery when there are many session files.
 pub(crate) fn discover_sessions(
     base_path: &Path,
     filter: &FilterConfig,
 ) -> Result<Vec<ConversationSession>> {
-    let mut sessions = Vec::new();
-
-    for entry in WalkDir::new(base_path)
+    // First, collect all matching file paths (sequential walk)
+    let paths: Vec<PathBuf> = WalkDir::new(base_path)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
+        .filter(|entry| {
+            let path = entry.path();
+            path.extension().and_then(|s| s.to_str()) == Some("jsonl")
+                && filter.should_include(path)
+        })
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
 
-        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            if !filter.should_include(path) {
-                continue;
+    // Parse files in parallel using rayon
+    let sessions: Vec<ConversationSession> = paths
+        .par_iter()
+        .filter_map(|path| match ConversationSession::from_file(path) {
+            Ok(session) => Some(session),
+            Err(e) => {
+                log::warn!("Failed to parse {}: {}", path.display(), e);
+                None
             }
-
-            match ConversationSession::from_file(path) {
-                Ok(session) => sessions.push(session),
-                Err(e) => {
-                    log::warn!("Failed to parse {}: {}", path.display(), e);
-                }
-            }
-        }
-    }
+        })
+        .collect();
 
     Ok(sessions)
 }

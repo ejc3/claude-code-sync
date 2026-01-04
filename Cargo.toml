@@ -24,6 +24,7 @@ env_logger = "0.11.8"
 atty = "0.2.14"
 fs2 = "0.4.3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rayon = "1.10"
 
 [dev-dependencies]
 tempfile = "3.23.0"
