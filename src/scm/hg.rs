@@ -259,8 +259,19 @@ impl Scm for HgScm {
     }
 
     fn pull(&self, remote: &str, _branch: &str) -> Result<()> {
-        // Pull and update
-        self.run_hg(&["pull", "-u", remote])?;
+        // Pull with rebase to prevent divergent heads (requires rebase extension)
+        // Falls back to pull -u if rebase extension not enabled
+        let result = Command::new("hg")
+            .args(["pull", "--rebase", remote])
+            .current_dir(&self.path)
+            .output()
+            .context("Failed to run 'hg pull --rebase'")?;
+
+        if !result.status.success() {
+            // Rebase extension might not be enabled, fall back to pull -u
+            log::info!("hg pull --rebase failed, falling back to pull -u");
+            self.run_hg(&["pull", "-u", remote])?;
+        }
         Ok(())
     }
 
