@@ -178,6 +178,10 @@ enum Commands {
         #[arg(long)]
         temp_branch_retention: Option<u32>,
 
+        /// Custom path to Claude projects directory (default: ~/.claude/projects)
+        #[arg(long)]
+        claude_projects_dir: Option<String>,
+
         /// Show current configuration
         #[arg(long)]
         show: bool,
@@ -427,6 +431,7 @@ fn main() -> Result<()> {
             scm_backend,
             sync_subdirectory,
             temp_branch_retention,
+            claude_projects_dir,
             show,
             interactive,
             wizard,
@@ -449,6 +454,7 @@ fn main() -> Result<()> {
                     scm_backend,
                     sync_subdirectory,
                     temp_branch_retention,
+                    claude_projects_dir,
                 )?;
             }
         }
