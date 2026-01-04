@@ -174,6 +174,10 @@ enum Commands {
         #[arg(long)]
         sync_subdirectory: Option<String>,
 
+        /// Hours to retain temp branches after pull (default: 24, 0 = delete immediately)
+        #[arg(long)]
+        temp_branch_retention: Option<u32>,
+
         /// Show current configuration
         #[arg(long)]
         show: bool,
@@ -422,6 +426,7 @@ fn main() -> Result<()> {
             lfs_patterns,
             scm_backend,
             sync_subdirectory,
+            temp_branch_retention,
             show,
             interactive,
             wizard,
@@ -443,6 +448,7 @@ fn main() -> Result<()> {
                     lfs_patterns,
                     scm_backend,
                     sync_subdirectory,
+                    temp_branch_retention,
                 )?;
             }
         }
