@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use inquire::Confirm;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::conflict::{analyze_session_relationship, ConflictDetector, SessionRelationship};
@@ -10,7 +10,7 @@ use crate::history::{
     ConversationSummary, OperationHistory, OperationRecord, OperationType, SyncOperation,
 };
 use crate::interactive_conflict;
-use crate::parser::ConversationSession;
+use crate::parser::{append_entries_to_file, make_content_key, ConversationSession};
 use crate::report::{save_conflict_report, ConflictReport};
 use crate::scm;
 
@@ -599,23 +599,106 @@ pub fn pull_history(
     }
 
     // ============================================================================
-    // STEP 6: Copy merged result to .claude
+    // STEP 6: Append-only merge to .claude
     // ============================================================================
+    // Key insight: Instead of rewriting files, we APPEND missing entries.
+    // This avoids race conditions with concurrent Claude Code writes.
     if verbosity != VerbosityLevel::Quiet {
-        println!("  {} merged sessions to .claude...", "Copying".cyan());
+        println!("  {} to .claude (append-only)...", "Syncing".cyan());
     }
 
-    let final_sessions = discover_sessions(&projects_dir, &filter)?;
-    for session in &final_sessions {
-        let relative_path = Path::new(&session.file_path)
+    // Re-read current local state (may have changed since step 2)
+    let current_local_sessions = discover_sessions(&claude_dir, &filter)?;
+    let current_local_map: HashMap<_, _> = current_local_sessions
+        .iter()
+        .map(|s| (s.session_id.clone(), s))
+        .collect();
+
+    // Read sync repo sessions (contains merged state)
+    let sync_repo_sessions = discover_sessions(&projects_dir, &filter)?;
+
+    let mut sessions_added = 0;
+    let mut sessions_appended = 0;
+    let mut entries_appended = 0;
+
+    for sync_session in &sync_repo_sessions {
+        let relative_path = Path::new(&sync_session.file_path)
             .strip_prefix(&projects_dir)
-            .unwrap_or(Path::new(&session.file_path));
-        let dest_path = claude_dir.join(relative_path);
-        session.write_to_file(&dest_path)?;
+            .unwrap_or(Path::new(&sync_session.file_path));
+        let local_path = claude_dir.join(relative_path);
+
+        if let Some(local_session) = current_local_map.get(&sync_session.session_id) {
+            // Session exists locally - append only missing entries
+
+            // Build sets of what's already in local
+            let local_uuids: HashSet<String> = local_session
+                .entries
+                .iter()
+                .filter_map(|e| e.uuid.clone())
+                .collect();
+
+            let local_non_uuid_keys: HashSet<String> = local_session
+                .entries
+                .iter()
+                .filter(|e| e.uuid.is_none())
+                .map(make_content_key)
+                .collect();
+
+            // Find entries in sync_repo that aren't in local
+            let entries_to_append: Vec<_> = sync_session
+                .entries
+                .iter()
+                .filter(|entry| {
+                    if let Some(ref uuid) = entry.uuid {
+                        !local_uuids.contains(uuid)
+                    } else {
+                        !local_non_uuid_keys.contains(&make_content_key(entry))
+                    }
+                })
+                .cloned()
+                .collect();
+
+            if !entries_to_append.is_empty() {
+                append_entries_to_file(&local_path, &entries_to_append)?;
+                entries_appended += entries_to_append.len();
+                sessions_appended += 1;
+
+                if verbosity == crate::VerbosityLevel::Verbose {
+                    println!(
+                        "    {} +{} entries to {}",
+                        "↳".dimmed(),
+                        entries_to_append.len(),
+                        sync_session.session_id
+                    );
+                }
+            }
+        } else {
+            // Session doesn't exist locally - copy entire file
+            sync_session.write_to_file(&local_path)?;
+            sessions_added += 1;
+
+            if verbosity == crate::VerbosityLevel::Verbose {
+                println!(
+                    "    {} new session {}",
+                    "↳".dimmed(),
+                    sync_session.session_id
+                );
+            }
+        }
     }
 
     if verbosity != VerbosityLevel::Quiet {
-        println!("  {} Updated {} sessions in .claude", "✓".green(), final_sessions.len());
+        if sessions_added > 0 || sessions_appended > 0 {
+            println!(
+                "  {} Added {} new sessions, appended {} entries to {} sessions",
+                "✓".green(),
+                sessions_added,
+                entries_appended,
+                sessions_appended
+            );
+        } else {
+            println!("  {} No changes needed in .claude", "✓".green());
+        }
     }
 
     // ============================================================================

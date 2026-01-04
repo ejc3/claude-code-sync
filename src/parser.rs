@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
@@ -223,6 +223,67 @@ impl ConversationSession {
     }
 }
 
+/// Append entries to a JSONL file without rewriting existing content.
+///
+/// This is safe for concurrent access - existing entries are never modified.
+/// Only new entries are appended to the end of the file. Data is flushed to
+/// disk before returning to ensure durability.
+///
+/// # Arguments
+/// * `path` - Path to the JSONL file
+/// * `entries` - Entries to append
+///
+/// # Safety
+/// - Existing file content is never modified
+/// - Uses `sync_all()` to ensure data reaches disk before returning
+/// - Partial writes during a crash are possible but won't corrupt existing data
+pub fn append_entries_to_file<P: AsRef<Path>>(path: P, entries: &[ConversationEntry]) -> Result<()> {
+    let path = path.as_ref();
+
+    // Create parent directories if they don't exist
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Failed to open file for appending: {}", path.display()))?;
+
+    for entry in entries {
+        let json = serde_json::to_string(entry).context("Failed to serialize conversation entry")?;
+        writeln!(file, "{json}")
+            .with_context(|| format!("Failed to append to file: {}", path.display()))?;
+    }
+
+    // Ensure data is flushed to disk for durability
+    file.sync_all()
+        .with_context(|| format!("Failed to sync file to disk: {}", path.display()))?;
+
+    Ok(())
+}
+
+/// Generate a deduplication key for entries without UUIDs.
+///
+/// For entries like `file-history-snapshot` that don't have UUIDs, we use
+/// a combination of (type, timestamp, content_hash) for deduplication.
+///
+/// Uses xxhash for cross-platform stability (same result on ARM and x86).
+pub fn make_content_key(entry: &ConversationEntry) -> String {
+    let ts = entry.timestamp.as_deref().unwrap_or("");
+    let content_hash = entry
+        .message
+        .as_ref()
+        .map(|m| {
+            let json = serde_json::to_string(m).unwrap_or_default();
+            xxhash_rust::xxh3::xxh3_64(json.as_bytes())
+        })
+        .unwrap_or(0);
+    format!("{}:{}:{:016x}", entry.entry_type, ts, content_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +377,172 @@ mod tests {
         let session = ConversationSession::from_file(&session_file).unwrap();
         assert_eq!(session.session_id, "test-123");
         assert_eq!(session.entries.len(), 2);
+    }
+
+    // =========================================================================
+    // Tests for append_entries_to_file
+    // =========================================================================
+
+    fn create_test_entry(uuid: &str, entry_type: &str, timestamp: &str) -> ConversationEntry {
+        ConversationEntry {
+            entry_type: entry_type.to_string(),
+            uuid: Some(uuid.to_string()),
+            parent_uuid: None,
+            session_id: Some("test-session".to_string()),
+            timestamp: Some(timestamp.to_string()),
+            message: Some(serde_json::json!({"text": format!("Message {}", uuid)})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn test_append_entries_creates_new_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("new_session.jsonl");
+
+        // File doesn't exist yet
+        assert!(!file_path.exists());
+
+        let entries = vec![
+            create_test_entry("1", "user", "2025-01-01T00:00:00Z"),
+            create_test_entry("2", "assistant", "2025-01-01T00:01:00Z"),
+        ];
+
+        append_entries_to_file(&file_path, &entries).unwrap();
+
+        // File should now exist with 2 entries
+        assert!(file_path.exists());
+        let session = ConversationSession::from_file(&file_path).unwrap();
+        assert_eq!(session.entries.len(), 2);
+        assert_eq!(session.entries[0].uuid, Some("1".to_string()));
+        assert_eq!(session.entries[1].uuid, Some("2".to_string()));
+    }
+
+    #[test]
+    fn test_append_entries_preserves_existing() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("existing_session.jsonl");
+
+        // Create initial file with 2 entries
+        let initial_entries = vec![
+            create_test_entry("1", "user", "2025-01-01T00:00:00Z"),
+            create_test_entry("2", "assistant", "2025-01-01T00:01:00Z"),
+        ];
+        let initial_session = ConversationSession {
+            session_id: "test-session".to_string(),
+            entries: initial_entries,
+            file_path: file_path.to_string_lossy().to_string(),
+        };
+        initial_session.write_to_file(&file_path).unwrap();
+
+        // Read original content for comparison
+        let original_content = fs::read_to_string(&file_path).unwrap();
+        let original_lines: Vec<&str> = original_content.lines().collect();
+        assert_eq!(original_lines.len(), 2);
+
+        // Append 2 more entries
+        let new_entries = vec![
+            create_test_entry("3", "user", "2025-01-01T00:02:00Z"),
+            create_test_entry("4", "assistant", "2025-01-01T00:03:00Z"),
+        ];
+        append_entries_to_file(&file_path, &new_entries).unwrap();
+
+        // Read new content
+        let new_content = fs::read_to_string(&file_path).unwrap();
+        let new_lines: Vec<&str> = new_content.lines().collect();
+
+        // Should have 4 entries total
+        assert_eq!(new_lines.len(), 4);
+
+        // First 2 lines should be EXACTLY the same as before (byte-for-byte)
+        assert_eq!(new_lines[0], original_lines[0], "First entry was modified!");
+        assert_eq!(new_lines[1], original_lines[1], "Second entry was modified!");
+
+        // Verify all entries via parsing
+        let session = ConversationSession::from_file(&file_path).unwrap();
+        assert_eq!(session.entries.len(), 4);
+        assert_eq!(session.entries[0].uuid, Some("1".to_string()));
+        assert_eq!(session.entries[1].uuid, Some("2".to_string()));
+        assert_eq!(session.entries[2].uuid, Some("3".to_string()));
+        assert_eq!(session.entries[3].uuid, Some("4".to_string()));
+    }
+
+    // =========================================================================
+    // Tests for make_content_key
+    // =========================================================================
+
+    #[test]
+    fn test_make_content_key_uniqueness() {
+        // Same type and timestamp but different message should produce different keys
+        let entry1 = ConversationEntry {
+            entry_type: "file-history-snapshot".to_string(),
+            uuid: None,
+            parent_uuid: None,
+            session_id: None,
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(serde_json::json!({"file": "a.txt", "content": "hello"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        };
+
+        let entry2 = ConversationEntry {
+            entry_type: "file-history-snapshot".to_string(),
+            uuid: None,
+            parent_uuid: None,
+            session_id: None,
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(serde_json::json!({"file": "b.txt", "content": "world"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        };
+
+        let key1 = make_content_key(&entry1);
+        let key2 = make_content_key(&entry2);
+
+        assert_ne!(key1, key2, "Different messages should produce different keys");
+    }
+
+    #[test]
+    fn test_make_content_key_same_content_same_key() {
+        // Identical entries should produce identical keys
+        let entry1 = ConversationEntry {
+            entry_type: "file-history-snapshot".to_string(),
+            uuid: None,
+            parent_uuid: None,
+            session_id: None,
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(serde_json::json!({"file": "test.txt"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        };
+
+        let entry2 = ConversationEntry {
+            entry_type: "file-history-snapshot".to_string(),
+            uuid: None,
+            parent_uuid: None,
+            session_id: None,
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(serde_json::json!({"file": "test.txt"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        };
+
+        assert_eq!(make_content_key(&entry1), make_content_key(&entry2));
     }
 }

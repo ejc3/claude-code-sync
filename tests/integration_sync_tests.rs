@@ -605,3 +605,296 @@ fn test_concurrent_push_pull_operations() {
         assert_eq!(op.affected_conversations[0].session_id, expected_session_id);
     }
 }
+
+/// Test that append-only sync correctly handles concurrent writes.
+///
+/// This simulates the scenario where:
+/// 1. A sync operation starts reading a session file
+/// 2. Claude Code writes new entries to the same file
+/// 3. The sync appends remote entries without losing the concurrent writes
+#[test]
+fn test_append_only_preserves_concurrent_writes() {
+    use claude_code_sync::parser::{append_entries_to_file, ConversationEntry};
+    use std::collections::HashSet;
+
+    let test_dir = TempDir::new().unwrap();
+    let session_file = test_dir.path().join("session.jsonl");
+
+    // Create helper to make test entries
+    let make_entry = |uuid: &str, msg: &str| -> ConversationEntry {
+        ConversationEntry {
+            entry_type: "user".to_string(),
+            uuid: Some(uuid.to_string()),
+            parent_uuid: None,
+            session_id: Some("test-session".to_string()),
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(serde_json::json!({"text": msg})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        }
+    };
+
+    // Step 1: Create initial session with 2 entries (simulating Machine A)
+    let initial_entries = vec![
+        make_entry("uuid-1", "Message 1"),
+        make_entry("uuid-2", "Message 2"),
+    ];
+    let initial_session = ConversationSession {
+        session_id: "test-session".to_string(),
+        entries: initial_entries.clone(),
+        file_path: session_file.to_string_lossy().to_string(),
+    };
+    initial_session.write_to_file(&session_file).unwrap();
+
+    // Step 2: Read the session (simulating sync reading "local" state)
+    let local_snapshot = ConversationSession::from_file(&session_file).unwrap();
+    let local_uuids: HashSet<String> = local_snapshot
+        .entries
+        .iter()
+        .filter_map(|e| e.uuid.clone())
+        .collect();
+    assert_eq!(local_uuids.len(), 2);
+
+    // Step 3: CONCURRENT WRITE - Claude Code adds a new entry
+    // This simulates a user continuing the conversation during sync
+    let concurrent_entry = make_entry("uuid-concurrent", "I was written during sync!");
+    append_entries_to_file(&session_file, &[concurrent_entry.clone()]).unwrap();
+
+    // Step 4: Simulate remote having different entries (from Machine B)
+    let remote_entries = vec![
+        make_entry("uuid-1", "Message 1"),  // Same as local
+        make_entry("uuid-2", "Message 2"),  // Same as local
+        make_entry("uuid-3", "Message from remote"), // New from remote
+        make_entry("uuid-4", "Another remote message"), // New from remote
+    ];
+
+    // Step 5: Append-only merge - only add entries not in local snapshot
+    let entries_to_append: Vec<_> = remote_entries
+        .iter()
+        .filter(|entry| {
+            if let Some(ref uuid) = entry.uuid {
+                !local_uuids.contains(uuid)
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+
+    // Should only append uuid-3 and uuid-4 (not uuid-1 and uuid-2)
+    assert_eq!(entries_to_append.len(), 2);
+    assert_eq!(entries_to_append[0].uuid, Some("uuid-3".to_string()));
+    assert_eq!(entries_to_append[1].uuid, Some("uuid-4".to_string()));
+
+    // Append the remote entries
+    append_entries_to_file(&session_file, &entries_to_append).unwrap();
+
+    // Step 6: Verify final state includes ALL entries
+    let final_session = ConversationSession::from_file(&session_file).unwrap();
+
+    // Should have: uuid-1, uuid-2 (original) + uuid-concurrent (concurrent) + uuid-3, uuid-4 (remote)
+    assert_eq!(final_session.entries.len(), 5, "Should have 5 entries total");
+
+    let final_uuids: Vec<String> = final_session
+        .entries
+        .iter()
+        .filter_map(|e| e.uuid.clone())
+        .collect();
+
+    // Verify all UUIDs are present
+    assert!(final_uuids.contains(&"uuid-1".to_string()), "Original entry 1 missing");
+    assert!(final_uuids.contains(&"uuid-2".to_string()), "Original entry 2 missing");
+    assert!(final_uuids.contains(&"uuid-concurrent".to_string()), "CONCURRENT WRITE WAS LOST!");
+    assert!(final_uuids.contains(&"uuid-3".to_string()), "Remote entry 3 missing");
+    assert!(final_uuids.contains(&"uuid-4".to_string()), "Remote entry 4 missing");
+
+    // Verify order: original entries first, then concurrent, then remote appends
+    assert_eq!(final_uuids[0], "uuid-1");
+    assert_eq!(final_uuids[1], "uuid-2");
+    assert_eq!(final_uuids[2], "uuid-concurrent");
+    assert_eq!(final_uuids[3], "uuid-3");
+    assert_eq!(final_uuids[4], "uuid-4");
+}
+
+/// Test that append-only sync handles non-UUID entries (like file-history-snapshot)
+#[test]
+fn test_append_only_non_uuid_entries() {
+    use claude_code_sync::parser::{append_entries_to_file, make_content_key, ConversationEntry};
+    use std::collections::HashSet;
+
+    let test_dir = TempDir::new().unwrap();
+    let session_file = test_dir.path().join("session.jsonl");
+
+    // Create helper to make non-UUID entries (like file-history-snapshot)
+    let make_snapshot = |file: &str, content: &str, ts: &str| -> ConversationEntry {
+        ConversationEntry {
+            entry_type: "file-history-snapshot".to_string(),
+            uuid: None,  // No UUID!
+            parent_uuid: None,
+            session_id: None,
+            timestamp: Some(ts.to_string()),
+            message: Some(serde_json::json!({"file": file, "content": content})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        }
+    };
+
+    // Create initial session with 2 non-UUID entries
+    let initial_entries = vec![
+        make_snapshot("file1.rs", "fn main() {}", "2025-01-01T00:00:00Z"),
+        make_snapshot("file2.rs", "pub fn hello() {}", "2025-01-01T00:01:00Z"),
+    ];
+    let initial_session = ConversationSession {
+        session_id: "test-session".to_string(),
+        entries: initial_entries.clone(),
+        file_path: session_file.to_string_lossy().to_string(),
+    };
+    initial_session.write_to_file(&session_file).unwrap();
+
+    // Read local state and build content key set
+    let local_snapshot = ConversationSession::from_file(&session_file).unwrap();
+    let local_content_keys: HashSet<String> = local_snapshot
+        .entries
+        .iter()
+        .filter(|e| e.uuid.is_none())
+        .map(|e| make_content_key(e))
+        .collect();
+    assert_eq!(local_content_keys.len(), 2);
+
+    // Remote has one duplicate and one new
+    let remote_entries = vec![
+        make_snapshot("file1.rs", "fn main() {}", "2025-01-01T00:00:00Z"), // Duplicate
+        make_snapshot("file3.rs", "struct Foo;", "2025-01-01T00:02:00Z"),  // New
+    ];
+
+    // Filter to only new entries
+    let entries_to_append: Vec<_> = remote_entries
+        .iter()
+        .filter(|entry| {
+            let key = make_content_key(entry);
+            !local_content_keys.contains(&key)
+        })
+        .cloned()
+        .collect();
+
+    // Should only append file3.rs
+    assert_eq!(entries_to_append.len(), 1);
+    assert!(entries_to_append[0].message.as_ref().unwrap().to_string().contains("file3.rs"));
+
+    // Append and verify
+    append_entries_to_file(&session_file, &entries_to_append).unwrap();
+
+    let final_session = ConversationSession::from_file(&session_file).unwrap();
+    assert_eq!(final_session.entries.len(), 3, "Should have 3 entries (2 original + 1 new)");
+
+    // Verify content deduplication worked
+    let file_names: Vec<String> = final_session
+        .entries
+        .iter()
+        .filter_map(|e| e.message.as_ref())
+        .filter_map(|m| m.get("file"))
+        .filter_map(|f| f.as_str())
+        .map(|s| s.to_string())
+        .collect();
+
+    assert_eq!(file_names, vec!["file1.rs", "file2.rs", "file3.rs"]);
+}
+
+/// Test append-only sync doesn't create duplicates even after multiple syncs
+#[test]
+fn test_append_only_idempotent() {
+    use claude_code_sync::parser::{append_entries_to_file, ConversationEntry};
+    use std::collections::HashSet;
+
+    let test_dir = TempDir::new().unwrap();
+    let session_file = test_dir.path().join("session.jsonl");
+
+    let make_entry = |uuid: &str| -> ConversationEntry {
+        ConversationEntry {
+            entry_type: "user".to_string(),
+            uuid: Some(uuid.to_string()),
+            parent_uuid: None,
+            session_id: Some("test-session".to_string()),
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(serde_json::json!({"text": "msg"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        }
+    };
+
+    // Create initial session
+    let initial_entries = vec![make_entry("uuid-1"), make_entry("uuid-2")];
+    let initial_session = ConversationSession {
+        session_id: "test-session".to_string(),
+        entries: initial_entries,
+        file_path: session_file.to_string_lossy().to_string(),
+    };
+    initial_session.write_to_file(&session_file).unwrap();
+
+    // Simulate multiple sync cycles with same remote data
+    let remote_entries = vec![
+        make_entry("uuid-1"), // Already exists
+        make_entry("uuid-2"), // Already exists
+        make_entry("uuid-3"), // New
+    ];
+
+    for sync_cycle in 1..=5 {
+        // Read current local state
+        let local_session = ConversationSession::from_file(&session_file).unwrap();
+        let local_uuids: HashSet<String> = local_session
+            .entries
+            .iter()
+            .filter_map(|e| e.uuid.clone())
+            .collect();
+
+        // Filter to only new entries
+        let entries_to_append: Vec<_> = remote_entries
+            .iter()
+            .filter(|e| {
+                if let Some(ref uuid) = e.uuid {
+                    !local_uuids.contains(uuid)
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        // Append if any
+        if !entries_to_append.is_empty() {
+            append_entries_to_file(&session_file, &entries_to_append).unwrap();
+        }
+
+        // Verify no duplicates
+        let final_session = ConversationSession::from_file(&session_file).unwrap();
+        let final_uuids: Vec<String> = final_session
+            .entries
+            .iter()
+            .filter_map(|e| e.uuid.clone())
+            .collect();
+
+        // Should always have exactly 3 entries after first sync
+        assert_eq!(
+            final_uuids.len(),
+            3,
+            "Cycle {}: Expected 3 entries, found {}. Duplicates detected!",
+            sync_cycle,
+            final_uuids.len()
+        );
+
+        // Verify unique
+        let unique_uuids: HashSet<_> = final_uuids.iter().collect();
+        assert_eq!(
+            unique_uuids.len(),
+            3,
+            "Cycle {}: Duplicate UUIDs found!",
+            sync_cycle
+        );
+    }
+}

@@ -168,7 +168,15 @@ impl<'a> SmartMerger<'a> {
             .collect()
     }
 
-    /// Detects edits (same UUID, different content) and resolves them by timestamp
+    /// Detects edits (same UUID, different content) and resolves them by timestamp.
+    ///
+    /// Note: This is a rare edge case. Claude Code generates unique UUIDs for each
+    /// message, so the same UUID having different content only occurs if:
+    /// 1. Someone manually edits a JSONL file
+    /// 2. A future Claude Code feature allows in-place message editing
+    ///
+    /// In practice, "edits" in Claude Code create new messages (new UUIDs) with
+    /// the same parentUuid, which are handled as branches, not edits.
     fn detect_and_resolve_edits(
         &mut self,
         local_map: &HashMap<String, ConversationEntry>,
