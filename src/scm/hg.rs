@@ -270,6 +270,49 @@ impl Scm for HgScm {
         self.run_hg(&["update", "-r", commit])?;
         Ok(())
     }
+
+    fn create_branch(&self, name: &str) -> Result<()> {
+        // Use bookmarks as they're closer to Git branches
+        self.run_hg(&["bookmark", name])?;
+        Ok(())
+    }
+
+    fn checkout(&self, branch: &str) -> Result<()> {
+        // Update to the bookmark
+        self.run_hg(&["update", branch])?;
+        Ok(())
+    }
+
+    fn merge(&self, branch: &str) -> Result<()> {
+        self.run_hg(&["merge", branch])?;
+        Ok(())
+    }
+
+    fn delete_branch(&self, name: &str) -> Result<()> {
+        // Delete the bookmark
+        self.run_hg(&["bookmark", "-d", name])?;
+        Ok(())
+    }
+
+    fn delete_remote_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        // Push with --delete to remove the bookmark from remote
+        // Note: This may not work with all Mercurial hosting services
+        self.run_hg(&["push", "-B", branch, "--delete", remote])?;
+        Ok(())
+    }
+
+    fn branch_exists(&self, name: &str) -> bool {
+        // Check if bookmark exists
+        self.run_hg(&["bookmark"])
+            .map(|output| output.lines().any(|line| line.contains(name)))
+            .unwrap_or(false)
+    }
+
+    fn fetch(&self, remote: &str) -> Result<()> {
+        // In Mercurial, pull without -u fetches without updating
+        self.run_hg(&["pull", remote])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

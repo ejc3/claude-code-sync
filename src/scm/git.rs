@@ -215,6 +215,34 @@ impl Scm for GitScm {
     fn reset_soft(&self, commit: &str) -> Result<()> {
         self.run_git_ok(&["reset", "--soft", commit])
     }
+
+    fn create_branch(&self, name: &str) -> Result<()> {
+        self.run_git_ok(&["branch", name])
+    }
+
+    fn checkout(&self, branch: &str) -> Result<()> {
+        self.run_git_ok(&["checkout", branch])
+    }
+
+    fn merge(&self, branch: &str) -> Result<()> {
+        self.run_git_ok(&["merge", branch])
+    }
+
+    fn delete_branch(&self, name: &str) -> Result<()> {
+        self.run_git_ok(&["branch", "-D", name])
+    }
+
+    fn delete_remote_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        self.run_git_ok(&["push", remote, "--delete", branch])
+    }
+
+    fn branch_exists(&self, name: &str) -> bool {
+        self.git_succeeds(&["rev-parse", "--verify", name])
+    }
+
+    fn fetch(&self, remote: &str) -> Result<()> {
+        self.run_git_ok(&["fetch", remote])
+    }
 }
 
 #[cfg(test)]

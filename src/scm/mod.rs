@@ -90,6 +90,27 @@ pub trait Scm: Send + Sync {
 
     /// Reset to a specific commit (soft reset - keeps working directory).
     fn reset_soft(&self, commit: &str) -> Result<()>;
+
+    /// Create a new branch at the current HEAD.
+    fn create_branch(&self, name: &str) -> Result<()>;
+
+    /// Checkout a branch (switch to it).
+    fn checkout(&self, branch: &str) -> Result<()>;
+
+    /// Merge a branch into the current branch.
+    fn merge(&self, branch: &str) -> Result<()>;
+
+    /// Delete a branch locally.
+    fn delete_branch(&self, name: &str) -> Result<()>;
+
+    /// Delete a branch on a remote.
+    fn delete_remote_branch(&self, remote: &str, branch: &str) -> Result<()>;
+
+    /// Check if a branch exists locally.
+    fn branch_exists(&self, name: &str) -> bool;
+
+    /// Fetch from a remote without merging.
+    fn fetch(&self, remote: &str) -> Result<()>;
 }
 
 /// Check if a directory is a repository (Git or Mercurial).

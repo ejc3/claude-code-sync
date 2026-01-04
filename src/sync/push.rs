@@ -17,6 +17,11 @@ use super::state::SyncState;
 use super::MAX_CONVERSATIONS_TO_DISPLAY;
 
 /// Push local Claude Code history to sync repository
+///
+/// Simplified workflow:
+/// 1. Copy local .claude sessions to sync repo
+/// 2. Commit changes
+/// 3. Push to remote (fail on conflict - user must pull first)
 pub fn push_history(
     commit_message: Option<&str>,
     push_remote: bool,
@@ -185,16 +190,13 @@ pub fn push_history(
     let has_changes = repo.has_changes()?;
     if has_changes {
         // Get the current commit hash before making any changes
-        // This allows us to undo the push later by resetting to this commit
-        // Note: We don't create file snapshots for push - git already has history!
-        // Undo push simply does `git reset` to this commit.
         let commit_before_push = repo
             .current_commit_hash()
             .context("Failed to get current commit hash")?;
 
         if verbosity != VerbosityLevel::Quiet {
             println!(
-                "  {} Recorded commit {} for undo",
+                "  {} Recorded commit {}",
                 "✓".green(),
                 &commit_before_push[..8]
             );
@@ -211,24 +213,37 @@ pub fn push_history(
         repo.commit(message)?;
         println!("  {} Committed: {}", "✓".green(), message);
 
-        // Push to remote if configured
+        // Push to remote if configured - simple push, fail on conflict
         if push_remote && state.has_remote {
-            // Always pull --rebase first to incorporate remote changes
-            // This prevents divergent branches when multiple hosts are syncing
-            println!("  {} from remote (rebase)...", "Pulling".cyan());
-            match repo.pull("origin", &branch_name) {
-                Ok(_) => println!("  {} Rebased on origin/{}", "✓".green(), branch_name),
-                Err(e) => {
-                    log::warn!("Failed to pull: {}", e);
-                    log::info!("Continuing with push attempt...");
-                }
-            }
-
             println!("  {} to remote...", "Pushing".cyan());
 
             match repo.push("origin", &branch_name) {
                 Ok(_) => println!("  {} Pushed to origin/{}", "✓".green(), branch_name),
-                Err(e) => log::warn!("Failed to push: {}", e),
+                Err(e) => {
+                    // Check if this is a conflict (non-fast-forward)
+                    let error_msg = e.to_string();
+                    if error_msg.contains("non-fast-forward")
+                        || error_msg.contains("fetch first")
+                        || error_msg.contains("rejected")
+                        || error_msg.contains("failed to push")
+                    {
+                        println!(
+                            "\n{} Remote has changes that aren't in your local repository.",
+                            "!".yellow().bold()
+                        );
+                        println!(
+                            "{} Run {} first to merge remote changes, then push again.",
+                            "→".cyan(),
+                            "claude-code-sync pull".bold()
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Push rejected: remote has new commits. Run 'claude-code-sync pull' first."
+                        ));
+                    } else {
+                        // Some other error
+                        return Err(e.context("Failed to push to remote"));
+                    }
+                }
             }
         }
 
@@ -241,7 +256,7 @@ pub fn push_history(
             pushed_conversations.clone(),
         );
 
-        // Store commit hash for undo (no file snapshot needed - git has history)
+        // Store commit hash for reference
         operation_record.commit_hash = Some(commit_before_push);
 
         // Load operation history and add this operation
@@ -345,11 +360,6 @@ pub fn push_history(
         println!("Push complete");
     } else {
         println!("\n{}", "Push complete!".green().bold());
-    }
-
-    // Clean up old snapshots automatically
-    if let Err(e) = crate::undo::cleanup_old_snapshots(None, false) {
-        log::warn!("Failed to cleanup old snapshots: {}", e);
     }
 
     Ok(())

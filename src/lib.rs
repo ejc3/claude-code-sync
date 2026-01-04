@@ -13,9 +13,9 @@
 //!
 //! - **Bidirectional sync**: Push local conversations to a Git repository and pull remote changes
 //! - **Conflict detection**: Automatically detects when the same conversation has diverged
-//! - **Interactive resolution**: Provides a TUI for resolving conflicts interactively
+//! - **Smart merge**: Fork-aware merging that preserves all conversation branches
+//! - **Safe sync**: Local changes are backed up to a remote temp branch before any merge
 //! - **Filtering**: Exclude attachments, old conversations, or specific projects
-//! - **Operation history**: Track all sync operations with automatic snapshots for undo
 //! - **Cross-platform**: Supports Linux, macOS, and Windows with platform-specific config directories
 //!
 //! ## Architecture
@@ -23,10 +23,10 @@
 //! The library is organized into modules that handle different aspects of the sync process:
 //!
 //! - Configuration and state management ([`config`], [`filter`])
-//! - Git operations ([`git`])
+//! - SCM operations ([`scm`])
 //! - Conversation parsing and analysis ([`parser`])
 //! - Conflict detection and resolution ([`conflict`])
-//! - Operation tracking and undo ([`history`], [`undo`])
+//! - Operation tracking ([`history`])
 //! - User interface and reporting ([`onboarding`], [`report`], [`logger`])
 //! - Core synchronization logic ([`sync`])
 
@@ -77,7 +77,7 @@ pub mod scm;
 ///
 /// Records all sync operations (push and pull) with metadata about affected
 /// conversations. Maintains a rolling history of recent operations with automatic
-/// rotation. Each operation record includes a snapshot path for undo functionality.
+/// rotation.
 pub mod history;
 
 /// Logging configuration and utilities.
@@ -123,12 +123,10 @@ pub mod report;
 /// - **Pull**: Merges remote conversations into local storage with conflict detection
 /// - **Sync**: Bidirectional operation that pulls then pushes for full synchronization
 ///
-/// Includes state management, session discovery, conflict handling, and operation tracking.
+/// The pull operation uses a safe temp-branch workflow:
+/// 1. Local changes are committed to a temp branch and pushed to remote
+/// 2. Main branch is updated from remote
+/// 3. Temp branch is merged into main with smart conflict resolution
+/// 4. Merged result is copied to ~/.claude
+/// 5. Temp branch is cleaned up
 pub mod sync;
-
-/// Snapshot-based undo functionality for sync operations.
-///
-/// Creates point-in-time snapshots of conversation files before sync operations.
-/// Snapshots enable undoing pull operations (by restoring files) and push operations
-/// (by resetting Git commits). Includes validation and security checks for safe restoration.
-pub mod undo;

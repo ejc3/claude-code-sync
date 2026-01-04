@@ -11,7 +11,6 @@ mod parser;
 mod report;
 mod scm;
 mod sync;
-mod undo;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -205,51 +204,10 @@ enum Commands {
         action: RemoteAction,
     },
 
-    /// Undo the last sync operation
-    Undo {
-        #[command(subcommand)]
-        operation: UndoOperation,
-
-        /// Show detailed verbose output
-        #[arg(short, long, global = true)]
-        verbose: bool,
-
-        /// Show minimal quiet output
-        #[arg(short, long, global = true, conflicts_with = "verbose")]
-        quiet: bool,
-    },
-
     /// View and manage operation history
     History {
         #[command(subcommand)]
         action: HistoryAction,
-    },
-
-    /// Clean up old snapshot files
-    CleanupSnapshots {
-        /// Show what would be deleted without actually deleting
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Maximum number of snapshots to keep per operation type
-        #[arg(long, default_value_t = 5)]
-        max_count: usize,
-
-        /// Maximum age of snapshots to keep (in days)
-        #[arg(long, default_value_t = 7)]
-        max_age_days: i64,
-
-        /// Interactive mode with detailed confirmation
-        #[arg(short, long)]
-        interactive: bool,
-
-        /// Show detailed verbose output
-        #[arg(short, long)]
-        verbose: bool,
-
-        /// Show minimal quiet output
-        #[arg(short, long, conflicts_with = "verbose")]
-        quiet: bool,
     },
 }
 
@@ -273,23 +231,6 @@ enum RemoteAction {
         /// Remote name (default: origin)
         #[arg(short, long, default_value = "origin")]
         name: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum UndoOperation {
-    /// Undo the last pull operation
-    Pull {
-        /// Preview the undo without executing it
-        #[arg(long)]
-        preview: bool,
-    },
-
-    /// Undo the last push operation
-    Push {
-        /// Preview the undo without executing it
-        #[arg(long)]
-        preview: bool,
     },
 }
 
@@ -519,25 +460,6 @@ fn main() -> Result<()> {
                 sync::remove_remote(&name)?;
             }
         },
-        Commands::Undo { operation, verbose, quiet } => {
-            // Determine verbosity level
-            let verbosity = if verbose {
-                VerbosityLevel::Verbose
-            } else if quiet {
-                VerbosityLevel::Quiet
-            } else {
-                VerbosityLevel::Normal
-            };
-
-            match operation {
-                UndoOperation::Pull { preview } => {
-                    handle_undo_pull(preview, verbosity)?;
-                }
-                UndoOperation::Push { preview } => {
-                    handle_undo_push(preview, verbosity)?;
-                }
-            }
-        },
         Commands::History { action } => match action {
             HistoryAction::List { limit } => {
                 handle_history_list(limit)?;
@@ -552,25 +474,6 @@ fn main() -> Result<()> {
                 handle_history_clear()?;
             }
         },
-        Commands::CleanupSnapshots {
-            dry_run,
-            max_count,
-            max_age_days,
-            interactive,
-            verbose,
-            quiet,
-        } => {
-            // Determine verbosity level
-            let verbosity = if verbose {
-                VerbosityLevel::Verbose
-            } else if quiet {
-                VerbosityLevel::Quiet
-            } else {
-                VerbosityLevel::Normal
-            };
-
-            handle_cleanup_snapshots(dry_run, max_count, max_age_days, interactive, verbosity)?;
-        }
     }
 
     Ok(())
