@@ -213,6 +213,17 @@ pub fn push_history(
 
         // Push to remote if configured
         if push_remote && state.has_remote {
+            // Always pull --rebase first to incorporate remote changes
+            // This prevents divergent branches when multiple hosts are syncing
+            println!("  {} from remote (rebase)...", "Pulling".cyan());
+            match repo.pull("origin", &branch_name) {
+                Ok(_) => println!("  {} Rebased on origin/{}", "✓".green(), branch_name),
+                Err(e) => {
+                    log::warn!("Failed to pull: {}", e);
+                    log::info!("Continuing with push attempt...");
+                }
+            }
+
             println!("  {} to remote...", "Pushing".cyan());
 
             match repo.push("origin", &branch_name) {
