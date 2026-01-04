@@ -427,9 +427,46 @@ pub fn pull_history(
                     (SyncOperation::Modified, true)
                 }
                 SessionRelationship::Diverged => {
-                    // Should have been caught as conflict, but handle anyway
+                    // Diverged session not caught by ConflictDetector - do inline merge
+                    // Combine entries from both versions using UUID-based deduplication
+                    let mut seen_uuids = std::collections::HashSet::new();
+                    let mut combined_entries = Vec::new();
+
+                    // Add all local entries first
+                    for entry in &local_session.entries {
+                        if let Some(ref uuid) = entry.uuid {
+                            seen_uuids.insert(uuid.clone());
+                        }
+                        combined_entries.push(entry.clone());
+                    }
+
+                    // Add remote entries that aren't already present
+                    for entry in &remote.entries {
+                        let dominated_by_local = entry.uuid.as_ref()
+                            .map(|u| seen_uuids.contains(u))
+                            .unwrap_or(false);
+                        if !dominated_by_local {
+                            combined_entries.push(entry.clone());
+                        }
+                    }
+
+                    // Sort by timestamp if available
+                    combined_entries.sort_by(|a, b| {
+                        a.timestamp.cmp(&b.timestamp)
+                    });
+
+                    // Write combined session
+                    let merged_session = crate::parser::ConversationSession {
+                        session_id: local_session.session_id.clone(),
+                        entries: combined_entries,
+                        file_path: local_session.file_path.clone(),
+                    };
+                    if let Err(e) = merged_session.write_to_file(&dest_path) {
+                        log::warn!("Failed to write merged diverged session: {}", e);
+                    }
+
                     modified_count += 1;
-                    (SyncOperation::Modified, true)
+                    (SyncOperation::Modified, false) // Already written above
                 }
             }
         } else {
