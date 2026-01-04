@@ -11,9 +11,31 @@ use crate::parser::ConversationSession;
 pub(crate) const LARGE_FILE_WARNING_THRESHOLD: u64 = 10 * 1024 * 1024;
 
 /// Get the Claude Code projects directory
+/// Uses custom path from filter config if specified, otherwise defaults to ~/.claude/projects
 pub(crate) fn claude_projects_dir() -> Result<PathBuf> {
+    // Try to load filter config to check for custom path
+    if let Ok(filter) = FilterConfig::load() {
+        if let Some(ref custom_path) = filter.claude_projects_dir {
+            return expand_tilde(custom_path);
+        }
+    }
+    // Default to ~/.claude/projects
     let home = dirs::home_dir().context("Failed to get home directory")?;
     Ok(home.join(".claude").join("projects"))
+}
+
+/// Expand tilde in path
+fn expand_tilde(path: &str) -> Result<PathBuf> {
+    if path.starts_with("~/") || path == "~" {
+        let home = dirs::home_dir().context("Failed to get home directory")?;
+        if path == "~" {
+            Ok(home)
+        } else {
+            Ok(home.join(&path[2..]))
+        }
+    } else {
+        Ok(PathBuf::from(path))
+    }
 }
 
 /// Discover all conversation sessions in Claude Code history

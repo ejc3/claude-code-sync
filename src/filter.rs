@@ -59,6 +59,11 @@ pub struct FilterConfig {
     /// Set to 0 to delete temp branches immediately after merge
     #[serde(default = "default_temp_branch_retention_hours")]
     pub temp_branch_retention_hours: u32,
+
+    /// Custom path to Claude projects directory (default: ~/.claude/projects)
+    /// Use this to sync from a non-standard location
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_projects_dir: Option<String>,
 }
 
 fn default_lfs_patterns() -> Vec<String> {
@@ -95,6 +100,7 @@ impl Default for FilterConfig {
             sync_subdirectory: default_sync_subdirectory(),
             use_project_name_only: false,
             temp_branch_retention_hours: default_temp_branch_retention_hours(),
+            claude_projects_dir: None,
         }
     }
 }
@@ -274,6 +280,7 @@ pub fn update_config(
     sync_subdirectory: Option<String>,
     use_project_name_only: Option<bool>,
     temp_branch_retention: Option<u32>,
+    claude_projects_dir: Option<String>,
 ) -> Result<()> {
     let mut config = FilterConfig::load()?;
 
@@ -387,6 +394,17 @@ pub fn update_config(
         println!("{}", msg.green());
     }
 
+    if let Some(dir) = claude_projects_dir {
+        let dir_trimmed = dir.trim().to_string();
+        if dir_trimmed.is_empty() {
+            config.claude_projects_dir = None;
+            println!("{}", "Reset Claude projects dir to default (~/.claude/projects)".green());
+        } else {
+            config.claude_projects_dir = Some(dir_trimmed.clone());
+            println!("{}", format!("Set Claude projects dir: {}", dir_trimmed).green());
+        }
+    }
+
     // Validate configuration before saving
     config.validate()?;
 
@@ -479,6 +497,15 @@ pub fn show_config() -> Result<()> {
             format!("{} hours", config.temp_branch_retention_hours)
         }
         .green()
+    );
+    println!(
+        "  {}: {}",
+        "Claude projects dir".cyan(),
+        config
+            .claude_projects_dir
+            .as_deref()
+            .unwrap_or("~/.claude/projects (default)")
+            .green()
     );
 
     Ok(())
