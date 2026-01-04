@@ -4,7 +4,7 @@ use inquire::Confirm;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::conflict::ConflictDetector;
+use crate::conflict::{analyze_session_relationship, ConflictDetector, SessionRelationship};
 use crate::filter::FilterConfig;
 use crate::history::{
     ConversationSummary, OperationHistory, OperationRecord, OperationType, SyncOperation,
@@ -183,15 +183,15 @@ pub fn pull_history(
 
     if detector.has_conflicts() {
         println!(
-            "  {} {} conflicts detected",
+            "  {} {} diverged sessions detected (will create forks)",
             "!".yellow(),
             detector.conflict_count()
         );
 
         // ============================================================================
-        // ATTEMPT SMART MERGE FIRST
+        // SMART MERGE - Combines both branches (like git merge for forks)
         // ============================================================================
-        println!("  {} smart merge...", "Attempting".cyan());
+        println!("  {} branches (fork-aware merge)...", "Combining".cyan());
 
         let local_map: HashMap<_, _> = local_sessions
             .iter()
@@ -239,7 +239,7 @@ pub fn pull_history(
                                 smart_merge_failed_conflicts.push(conflict.clone());
                             } else {
                                 println!(
-                                    "  {} Smart merged {} ({} local + {} remote = {} total, {} branches)",
+                                    "  {} Forked {} ({} local + {} remote = {} combined, {} branch points)",
                                     "✓".green(),
                                     conflict.session_id,
                                     stats.local_messages,
@@ -260,7 +260,7 @@ pub fn pull_history(
         }
 
         println!(
-            "  {} Successfully smart merged {}/{} conflicts",
+            "  {} Successfully merged {}/{} diverged sessions as forks",
             "✓".green(),
             smart_merge_success_count,
             detector.conflict_count()
@@ -407,9 +407,10 @@ pub fn pull_history(
     let mut modified_count = 0;
     let mut unchanged_count = 0;
     let mut skipped_no_local_match = 0;
+    let mut skipped_local_newer = 0;
 
     for remote_session in &remote_sessions {
-        // Skip if conflicts were detected
+        // Skip if conflicts were detected (these are handled separately)
         if detector
             .conflicts()
             .iter()
@@ -465,22 +466,42 @@ pub fn pull_history(
             (claude_dir.join(relative_path), relative_path.to_path_buf())
         };
 
-        // Determine operation type based on local state
-        let operation = if let Some(local) = local_map.get(&remote_session.session_id) {
-            if local.content_hash() == remote_session.content_hash() {
-                unchanged_count += 1;
-                SyncOperation::Unchanged
-            } else {
-                modified_count += 1;
-                SyncOperation::Modified
+        // Determine operation type based on local state and session relationship
+        let (operation, should_copy) = if let Some(local) = local_map.get(&remote_session.session_id) {
+            // Analyze the relationship between local and remote
+            let relationship = analyze_session_relationship(local, remote_session);
+
+            match relationship {
+                SessionRelationship::Identical => {
+                    unchanged_count += 1;
+                    (SyncOperation::Unchanged, false)
+                }
+                SessionRelationship::LocalIsPrefix => {
+                    // Remote has more messages - copy remote to local
+                    modified_count += 1;
+                    (SyncOperation::Modified, true)
+                }
+                SessionRelationship::RemoteIsPrefix => {
+                    // Local has more messages - DO NOT overwrite with shorter remote
+                    // This is the key fix: keep local, don't copy remote
+                    skipped_local_newer += 1;
+                    (SyncOperation::Unchanged, false)
+                }
+                SessionRelationship::Diverged => {
+                    // This shouldn't happen - diverged sessions should be conflicts
+                    // But if we get here, treat as modified and copy
+                    modified_count += 1;
+                    (SyncOperation::Modified, true)
+                }
             }
         } else {
+            // Session doesn't exist locally - new session
             added_count += 1;
-            SyncOperation::Added
+            (SyncOperation::Added, true)
         };
 
-        // Copy file if it's not unchanged
-        if operation != SyncOperation::Unchanged {
+        // Copy file only if appropriate
+        if should_copy {
             remote_session.write_to_file(&dest_path)?;
             merged_count += 1;
         }
@@ -500,6 +521,13 @@ pub fn pull_history(
     }
 
     println!("  {} Merged {} sessions", "✓".green(), merged_count);
+    if skipped_local_newer > 0 {
+        println!(
+            "  {} Kept {} local sessions (already ahead of remote)",
+            "✓".green(),
+            skipped_local_newer
+        );
+    }
 
     // ============================================================================
     // CREATE AND SAVE OPERATION RECORD
@@ -534,12 +562,12 @@ pub fn pull_history(
     println!("\n{}", "=== Pull Summary ===".bold().cyan());
 
     // Show operation statistics
-    let conflict_count = detector.conflict_count();
+    let fork_count = detector.conflict_count();
     let stats_msg = format!(
-        "  {} Added    {} Modified    {} Conflicts    {} Unchanged",
+        "  {} Added    {} Modified    {} Forked    {} Unchanged",
         format!("{added_count}").green(),
         format!("{modified_count}").cyan(),
-        format!("{conflict_count}").yellow(),
+        format!("{fork_count}").yellow(),
         format!("{unchanged_count}").dimmed(),
     );
     println!("{stats_msg}");
@@ -548,6 +576,12 @@ pub fn pull_history(
             "  {} Skipped (no local match): {}",
             "!".yellow(),
             skipped_no_local_match
+        );
+    }
+    if skipped_local_newer > 0 {
+        println!(
+            "  (Skipped {} sessions where local was ahead of remote)",
+            skipped_local_newer
         );
     }
     println!();
@@ -584,7 +618,7 @@ pub fn pull_history(
                 let operation_str = match conv.operation {
                     SyncOperation::Added => "ADD".green(),
                     SyncOperation::Modified => "MOD".cyan(),
-                    SyncOperation::Conflict => "CONFLICT".yellow(),
+                    SyncOperation::Conflict => "FORK".yellow(),
                     SyncOperation::Unchanged => "---".dimmed(),
                 };
 
