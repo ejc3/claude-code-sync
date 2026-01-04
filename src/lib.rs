@@ -80,6 +80,12 @@ pub mod scm;
 /// rotation.
 pub mod history;
 
+/// File-based locking to prevent concurrent sync operations.
+///
+/// Uses `flock` (via fs2) to ensure only one sync runs at a time.
+/// Acquiring the lock fails fast if another sync is already running.
+pub mod lock;
+
 /// Logging configuration and utilities.
 ///
 /// Sets up dual logging to both console (configurable via `RUST_LOG` environment

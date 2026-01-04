@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::conflict::{analyze_session_relationship, ConflictDetector, SessionRelationship};
+use crate::lock::SyncLock;
 use crate::filter::FilterConfig;
 use crate::history::{
     ConversationSummary, OperationHistory, OperationRecord, OperationType, SyncOperation,
@@ -41,6 +42,9 @@ pub fn pull_history(
     verbosity: crate::VerbosityLevel,
 ) -> Result<()> {
     use crate::VerbosityLevel;
+
+    // Acquire exclusive lock to prevent concurrent sync operations
+    let _lock = SyncLock::acquire()?;
 
     if verbosity != VerbosityLevel::Quiet {
         println!("{}", "Pulling Claude Code history...".cyan().bold());

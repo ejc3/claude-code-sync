@@ -4,6 +4,7 @@ mod filter;
 mod handlers;
 mod history;
 mod interactive_conflict;
+mod lock;
 mod logger;
 mod merge;
 mod onboarding;

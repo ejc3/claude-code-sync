@@ -5,6 +5,7 @@ use inquire::Confirm;
 use crate::filter::FilterConfig;
 use crate::history::{OperationHistory, OperationRecord, OperationType};
 use crate::interactive_conflict;
+use crate::lock::SyncLock;
 use crate::scm;
 
 use super::state::SyncState;
@@ -27,6 +28,9 @@ pub fn push_history(
     verbosity: crate::VerbosityLevel,
 ) -> Result<()> {
     use crate::VerbosityLevel;
+
+    // Acquire exclusive lock to prevent concurrent sync operations
+    let _lock = SyncLock::acquire()?;
 
     if verbosity != VerbosityLevel::Quiet {
         println!("{}", "Pushing Claude Code history...".cyan().bold());
