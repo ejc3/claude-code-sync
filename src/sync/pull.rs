@@ -561,6 +561,19 @@ pub fn pull_history(
     }
 
     // ============================================================================
+    // STEP 6b: Merge history.jsonl (session index for --resume picker)
+    // ============================================================================
+    let claude_base_dir = claude_dir.parent().unwrap_or(&claude_dir);
+    let local_history = claude_base_dir.join("history.jsonl");
+    let sync_history = state.sync_repo_path.join("history.jsonl");
+
+    if sync_history.exists() {
+        println!("  {} history.jsonl...", "Merging".cyan());
+        merge_history_to_local(&sync_history, &local_history)?;
+        println!("  {} history.jsonl merged", "✓".green());
+    }
+
+    // ============================================================================
     // STEP 7: Clean up temp branch (respects retention config)
     // ============================================================================
     cleanup_temp_branch(
@@ -811,6 +824,95 @@ fn cleanup_old_temp_branches(
             if cleaned == 1 { "" } else { "es" }
         );
     }
+
+    Ok(())
+}
+
+/// Merge history.jsonl from sync repo into local, deduplicating by (sessionId, timestamp)
+fn merge_history_to_local(sync_path: &Path, local_path: &Path) -> Result<()> {
+    use std::collections::HashSet;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+
+    // Read existing entries from local (if exists)
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
+    let mut entries: Vec<String> = Vec::new();
+
+    // First, read local entries (these take priority)
+    if local_path.exists() {
+        let file = fs::File::open(local_path)?;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                let session_id = value
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let timestamp = value.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                if !session_id.is_empty() {
+                    seen.insert((session_id, timestamp));
+                }
+                entries.push(line);
+            }
+        }
+    }
+
+    // Then, add sync repo entries that aren't already present
+    let sync_file = fs::File::open(sync_path)?;
+    let mut added = 0;
+    for line in BufReader::new(sync_file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            let session_id = value
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timestamp = value.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            if !session_id.is_empty() && !seen.contains(&(session_id.clone(), timestamp)) {
+                seen.insert((session_id, timestamp));
+                entries.push(line);
+                added += 1;
+            }
+        }
+    }
+
+    // Sort by timestamp (newest last for append-log style)
+    entries.sort_by(|a, b| {
+        let ts_a = serde_json::from_str::<serde_json::Value>(a)
+            .ok()
+            .and_then(|v| v.get("timestamp").and_then(|t| t.as_i64()))
+            .unwrap_or(0);
+        let ts_b = serde_json::from_str::<serde_json::Value>(b)
+            .ok()
+            .and_then(|v| v.get("timestamp").and_then(|t| t.as_i64()))
+            .unwrap_or(0);
+        ts_a.cmp(&ts_b)
+    });
+
+    // Write merged result
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::File::create(local_path)?;
+    for entry in &entries {
+        writeln!(file, "{}", entry)?;
+    }
+
+    log::info!(
+        "Merged history.jsonl to local: {} total entries, {} new from sync repo",
+        entries.len(),
+        added
+    );
 
     Ok(())
 }

@@ -189,6 +189,26 @@ pub fn push_history(
     }
 
     // ============================================================================
+    // SYNC HISTORY.JSONL (session index for --resume picker)
+    // ============================================================================
+    let claude_base_dir = claude_dir.parent().unwrap_or(&claude_dir);
+    let local_history = claude_base_dir.join("history.jsonl");
+    let sync_history = state.sync_repo_path.join("history.jsonl");
+
+    if local_history.exists() {
+        println!("  {} history.jsonl...", "Syncing".cyan());
+
+        // If sync repo already has history.jsonl, merge them
+        if sync_history.exists() {
+            merge_history_files(&local_history, &sync_history)?;
+        } else {
+            // First time - just copy
+            fs::copy(&local_history, &sync_history)?;
+        }
+        println!("  {} history.jsonl synced", "✓".green());
+    }
+
+    // ============================================================================
     // SHOW SUMMARY AND INTERACTIVE CONFIRMATION
     // ============================================================================
     if verbosity != VerbosityLevel::Quiet {
@@ -432,6 +452,91 @@ pub fn push_history(
     } else {
         println!("\n{}", "Push complete!".green().bold());
     }
+
+    Ok(())
+}
+
+/// Merge two history.jsonl files, deduplicating by (sessionId, timestamp)
+fn merge_history_files(local_path: &Path, sync_path: &Path) -> Result<()> {
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader, Write};
+
+    // Read existing entries from sync repo
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
+    let mut entries: Vec<String> = Vec::new();
+
+    // First, read sync repo entries (these are the "base")
+    if sync_path.exists() {
+        let file = fs::File::open(sync_path)?;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                let session_id = value
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let timestamp = value.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                if !session_id.is_empty() {
+                    seen.insert((session_id, timestamp));
+                }
+                entries.push(line);
+            }
+        }
+    }
+
+    // Then, add local entries that aren't already present
+    let local_file = fs::File::open(local_path)?;
+    let mut added = 0;
+    for line in BufReader::new(local_file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            let session_id = value
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timestamp = value.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            if !session_id.is_empty() && !seen.contains(&(session_id.clone(), timestamp)) {
+                seen.insert((session_id, timestamp));
+                entries.push(line);
+                added += 1;
+            }
+        }
+    }
+
+    // Sort by timestamp (newest last for append-log style)
+    entries.sort_by(|a, b| {
+        let ts_a = serde_json::from_str::<serde_json::Value>(a)
+            .ok()
+            .and_then(|v| v.get("timestamp").and_then(|t| t.as_i64()))
+            .unwrap_or(0);
+        let ts_b = serde_json::from_str::<serde_json::Value>(b)
+            .ok()
+            .and_then(|v| v.get("timestamp").and_then(|t| t.as_i64()))
+            .unwrap_or(0);
+        ts_a.cmp(&ts_b)
+    });
+
+    // Write merged result
+    let mut file = fs::File::create(sync_path)?;
+    for entry in &entries {
+        writeln!(file, "{}", entry)?;
+    }
+
+    log::info!(
+        "Merged history.jsonl: {} total entries, {} new from local",
+        entries.len(),
+        added
+    );
 
     Ok(())
 }
