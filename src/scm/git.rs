@@ -192,11 +192,14 @@ impl Scm for GitScm {
     }
 
     fn pull(&self, remote: &str, branch: &str) -> Result<()> {
+        // Always use --rebase to prevent divergent branches.
+        // This ensures local commits are replayed on top of remote,
+        // keeping a linear history and avoiding merge conflicts.
         let output = Command::new("git")
-            .args(["pull", remote, branch])
+            .args(["pull", "--rebase", remote, branch])
             .current_dir(&self.workdir)
             .output()
-            .context("Failed to run 'git pull'")?;
+            .context("Failed to run 'git pull --rebase'")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
