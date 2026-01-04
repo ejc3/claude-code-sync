@@ -138,6 +138,18 @@ pub fn pull_history(
             Err(e) => {
                 log::warn!("Failed to push temp branch: {}", e);
                 log::info!("Continuing - local temp branch still preserves your work");
+                if verbosity != VerbosityLevel::Quiet {
+                    println!(
+                        "  {} Could not push temp branch: {}",
+                        "!".yellow().bold(),
+                        e
+                    );
+                    println!(
+                        "  {} Local temp branch {} still preserves your work",
+                        "ℹ".cyan(),
+                        temp_branch
+                    );
+                }
             }
         }
     }
@@ -157,6 +169,9 @@ pub fn pull_history(
             println!("  {} from remote...", "Pulling".cyan());
         }
 
+        let mut fetch_failed = false;
+        let mut pull_failed = false;
+
         // First fetch to see what's on remote
         match repo.fetch("origin") {
             Ok(_) => {
@@ -166,6 +181,14 @@ pub fn pull_history(
             }
             Err(e) => {
                 log::warn!("Failed to fetch: {}", e);
+                fetch_failed = true;
+                if verbosity != VerbosityLevel::Quiet {
+                    println!(
+                        "  {} Failed to fetch from origin: {}",
+                        "!".yellow().bold(),
+                        e
+                    );
+                }
             }
         }
 
@@ -179,7 +202,24 @@ pub fn pull_history(
             Err(e) => {
                 log::warn!("Failed to pull: {}", e);
                 log::info!("Continuing with local state...");
+                pull_failed = true;
+                if verbosity != VerbosityLevel::Quiet {
+                    println!(
+                        "  {} Failed to pull from origin/{}: {}",
+                        "!".yellow().bold(),
+                        main_branch,
+                        e
+                    );
+                }
             }
+        }
+
+        // Inform user if network operations failed
+        if (fetch_failed || pull_failed) && verbosity != VerbosityLevel::Quiet {
+            println!(
+                "  {} Continuing with local state (remote changes may not be included)",
+                "ℹ".cyan()
+            );
         }
     }
 
@@ -429,22 +469,41 @@ pub fn pull_history(
                 SessionRelationship::Diverged => {
                     // Diverged session not caught by ConflictDetector - do inline merge
                     // Combine entries from both versions using UUID-based deduplication
+                    // For entries without UUIDs, use (type, timestamp, content_hash) as key
                     let mut seen_uuids = std::collections::HashSet::new();
+                    let mut seen_non_uuid = std::collections::HashSet::new();
                     let mut combined_entries = Vec::new();
+
+                    // Helper to create a dedup key for entries without UUIDs
+                    // Uses xxhash for cross-platform stability (same result on ARM and x86)
+                    let make_non_uuid_key = |entry: &crate::parser::ConversationEntry| -> String {
+                        let ts = entry.timestamp.as_deref().unwrap_or("");
+                        let content_hash = entry.message.as_ref()
+                            .map(|m| {
+                                let json = serde_json::to_string(m).unwrap_or_default();
+                                xxhash_rust::xxh3::xxh3_64(json.as_bytes())
+                            })
+                            .unwrap_or(0);
+                        format!("{}:{}:{:016x}", entry.entry_type, ts, content_hash)
+                    };
 
                     // Add all local entries first
                     for entry in &local_session.entries {
                         if let Some(ref uuid) = entry.uuid {
                             seen_uuids.insert(uuid.clone());
+                        } else {
+                            seen_non_uuid.insert(make_non_uuid_key(entry));
                         }
                         combined_entries.push(entry.clone());
                     }
 
                     // Add remote entries that aren't already present
                     for entry in &remote.entries {
-                        let dominated_by_local = entry.uuid.as_ref()
-                            .map(|u| seen_uuids.contains(u))
-                            .unwrap_or(false);
+                        let dominated_by_local = if let Some(ref uuid) = entry.uuid {
+                            seen_uuids.contains(uuid)
+                        } else {
+                            seen_non_uuid.contains(&make_non_uuid_key(entry))
+                        };
                         if !dominated_by_local {
                             combined_entries.push(entry.clone());
                         }
@@ -568,8 +627,13 @@ pub fn pull_history(
 
     if sync_history.exists() {
         println!("  {} history.jsonl...", "Merging".cyan());
-        merge_history_to_local(&sync_history, &local_history)?;
-        println!("  {} history.jsonl merged", "✓".green());
+        // Merge sync repo entries into local, with local entries taking priority
+        let (total, added) = super::history_merge::merge_history_files(
+            &sync_history,
+            &local_history,
+            super::history_merge::MergePriority::TargetFirst,
+        )?;
+        println!("  {} history.jsonl merged ({} entries, {} new)", "✓".green(), total, added);
     }
 
     // ============================================================================
@@ -827,91 +891,3 @@ fn cleanup_old_temp_branches(
     Ok(())
 }
 
-/// Merge history.jsonl from sync repo into local, deduplicating by (sessionId, timestamp)
-fn merge_history_to_local(sync_path: &Path, local_path: &Path) -> Result<()> {
-    use std::collections::HashSet;
-    use std::fs;
-    use std::io::{BufRead, BufReader, Write};
-
-    // Read existing entries from local (if exists)
-    let mut seen: HashSet<(String, i64)> = HashSet::new();
-    let mut entries: Vec<String> = Vec::new();
-
-    // First, read local entries (these take priority)
-    if local_path.exists() {
-        let file = fs::File::open(local_path)?;
-        for line in BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                let session_id = value
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let timestamp = value.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-
-                if !session_id.is_empty() {
-                    seen.insert((session_id, timestamp));
-                }
-                entries.push(line);
-            }
-        }
-    }
-
-    // Then, add sync repo entries that aren't already present
-    let sync_file = fs::File::open(sync_path)?;
-    let mut added = 0;
-    for line in BufReader::new(sync_file).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-            let session_id = value
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let timestamp = value.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-
-            if !session_id.is_empty() && !seen.contains(&(session_id.clone(), timestamp)) {
-                seen.insert((session_id, timestamp));
-                entries.push(line);
-                added += 1;
-            }
-        }
-    }
-
-    // Sort by timestamp (newest last for append-log style)
-    entries.sort_by(|a, b| {
-        let ts_a = serde_json::from_str::<serde_json::Value>(a)
-            .ok()
-            .and_then(|v| v.get("timestamp").and_then(|t| t.as_i64()))
-            .unwrap_or(0);
-        let ts_b = serde_json::from_str::<serde_json::Value>(b)
-            .ok()
-            .and_then(|v| v.get("timestamp").and_then(|t| t.as_i64()))
-            .unwrap_or(0);
-        ts_a.cmp(&ts_b)
-    });
-
-    // Write merged result
-    if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::File::create(local_path)?;
-    for entry in &entries {
-        writeln!(file, "{}", entry)?;
-    }
-
-    log::info!(
-        "Merged history.jsonl to local: {} total entries, {} new from sync repo",
-        entries.len(),
-        added
-    );
-
-    Ok(())
-}

@@ -255,34 +255,91 @@ impl<'a> SmartMerger<'a> {
                 .push(uuid.clone());
         }
 
-        // Build tree recursively
+        // Build tree recursively with cycle detection
         fn build_subtree(
             uuid: &str,
             uuid_to_entry: &HashMap<String, ConversationEntry>,
             parent_to_children: &HashMap<Option<String>, Vec<String>>,
-        ) -> MessageNode {
-            let entry = uuid_to_entry.get(uuid).unwrap().clone();
+            visited: &mut HashSet<String>,
+        ) -> Option<MessageNode> {
+            // Cycle detection: if we've already visited this UUID in this path, skip it
+            if visited.contains(uuid) {
+                log::warn!("Cycle detected in message tree at UUID: {}", uuid);
+                return None;
+            }
+            visited.insert(uuid.to_string());
+
+            let entry = uuid_to_entry.get(uuid)?.clone();
             let mut node = MessageNode::new(entry);
 
             // Get children for this UUID
             if let Some(child_uuids) = parent_to_children.get(&Some(uuid.to_string())) {
                 for child_uuid in child_uuids {
-                    let child_node = build_subtree(child_uuid, uuid_to_entry, parent_to_children);
-                    node.add_child(child_node);
+                    if let Some(child_node) = build_subtree(child_uuid, uuid_to_entry, parent_to_children, visited) {
+                        node.add_child(child_node);
+                    }
                 }
             }
 
-            node
+            // Remove from visited when done with this path (allows siblings)
+            visited.remove(uuid);
+            Some(node)
         }
 
-        // Find root UUIDs (entries with no parent)
-        let root_uuids = parent_to_children.get(&None).cloned().unwrap_or_default();
+        // Find root UUIDs (entries with no parent OR entries whose parent doesn't exist)
+        let mut root_uuids = parent_to_children.get(&None).cloned().unwrap_or_default();
 
-        // Build trees from each root
+        // Also find orphaned nodes (entries whose parent_uuid is not in our tree)
+        // These become additional roots instead of being silently dropped
+        for (uuid, entry) in &uuid_to_entry {
+            if let Some(ref parent_uuid) = entry.parent_uuid {
+                // If the parent doesn't exist in our tree, this is an orphan
+                if !uuid_to_entry.contains_key(parent_uuid) {
+                    log::debug!("Found orphaned node {} (parent {} not in tree), treating as root", uuid, parent_uuid);
+                    root_uuids.push(uuid.clone());
+                }
+            }
+        }
+
+        // Build trees from each root with cycle detection
         let mut roots = Vec::new();
+        let mut visited = HashSet::new();
+        let mut included_uuids = HashSet::new();
+
         for root_uuid in root_uuids {
-            let root_node = build_subtree(&root_uuid, &uuid_to_entry, &parent_to_children);
-            roots.push(root_node);
+            if let Some(root_node) = build_subtree(&root_uuid, &uuid_to_entry, &parent_to_children, &mut visited) {
+                // Track all UUIDs included in this subtree
+                fn collect_uuids(node: &MessageNode, set: &mut HashSet<String>) {
+                    if let Some(ref uuid) = node.entry.uuid {
+                        set.insert(uuid.clone());
+                    }
+                    for child in &node.children {
+                        collect_uuids(child, set);
+                    }
+                }
+                collect_uuids(&root_node, &mut included_uuids);
+                roots.push(root_node);
+            }
+        }
+
+        // Handle entries in pure cycles (entries that weren't reached from any root)
+        // These are entries where the parent exists but we never found a valid root for them
+        for uuid in uuid_to_entry.keys() {
+            if !included_uuids.contains(uuid) {
+                log::debug!("Entry {} is in a cycle or unreachable, adding as orphan root", uuid);
+                if let Some(root_node) = build_subtree(uuid, &uuid_to_entry, &parent_to_children, &mut visited) {
+                    fn collect_uuids(node: &MessageNode, set: &mut HashSet<String>) {
+                        if let Some(ref uuid) = node.entry.uuid {
+                            set.insert(uuid.clone());
+                        }
+                        for child in &node.children {
+                            collect_uuids(child, set);
+                        }
+                    }
+                    collect_uuids(&root_node, &mut included_uuids);
+                    roots.push(root_node);
+                }
+            }
         }
 
         // Count branches
@@ -718,5 +775,100 @@ mod tests {
             result.merged_entries[0].message,
             Some(json!({"text": "Remote version (newer)"}))
         );
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        // Create a cycle: A -> B -> A
+        let entry_a = ConversationEntry {
+            entry_type: "user".to_string(),
+            uuid: Some("A".to_string()),
+            parent_uuid: Some("B".to_string()), // A's parent is B
+            session_id: Some("test-session".to_string()),
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(json!({"text": "Message A"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        };
+
+        let entry_b = ConversationEntry {
+            entry_type: "assistant".to_string(),
+            uuid: Some("B".to_string()),
+            parent_uuid: Some("A".to_string()), // B's parent is A (cycle!)
+            session_id: Some("test-session".to_string()),
+            timestamp: Some("2025-01-01T00:01:00Z".to_string()),
+            message: Some(json!({"text": "Message B"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        };
+
+        let local = ConversationSession {
+            session_id: "test-session".to_string(),
+            entries: vec![entry_a],
+            file_path: "local.jsonl".to_string(),
+        };
+
+        let remote = ConversationSession {
+            session_id: "test-session".to_string(),
+            entries: vec![entry_b],
+            file_path: "remote.jsonl".to_string(),
+        };
+
+        // Should not panic or hang - cycle detection should prevent infinite recursion
+        let result = merge_conversations(&local, &remote);
+        assert!(result.is_ok(), "Merge should succeed even with cycles");
+
+        // Both entries should be included (as orphans, since each parent doesn't exist)
+        let merged = result.unwrap();
+        assert!(merged.merged_entries.len() >= 1, "Should have at least one entry");
+    }
+
+    #[test]
+    fn test_orphaned_nodes_preserved() {
+        // Create an entry whose parent doesn't exist
+        let orphan_entry = ConversationEntry {
+            entry_type: "user".to_string(),
+            uuid: Some("orphan".to_string()),
+            parent_uuid: Some("nonexistent-parent".to_string()),
+            session_id: Some("test-session".to_string()),
+            timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            message: Some(json!({"text": "I'm an orphan"})),
+            cwd: None,
+            version: None,
+            git_branch: None,
+            extra: serde_json::Value::Null,
+        };
+
+        // Create a normal entry with no parent
+        let root_entry = create_test_entry("root", None, "2025-01-01T00:01:00Z");
+
+        let local = ConversationSession {
+            session_id: "test-session".to_string(),
+            entries: vec![orphan_entry],
+            file_path: "local.jsonl".to_string(),
+        };
+
+        let remote = ConversationSession {
+            session_id: "test-session".to_string(),
+            entries: vec![root_entry],
+            file_path: "remote.jsonl".to_string(),
+        };
+
+        let result = merge_conversations(&local, &remote).unwrap();
+
+        // Both entries should be in the result - orphan should not be dropped
+        assert_eq!(result.merged_entries.len(), 2, "Orphan should be preserved as a root");
+
+        let uuids: Vec<String> = result
+            .merged_entries
+            .iter()
+            .filter_map(|e| e.uuid.clone())
+            .collect();
+        assert!(uuids.contains(&"orphan".to_string()), "Orphan entry should be in merged result");
+        assert!(uuids.contains(&"root".to_string()), "Root entry should be in merged result");
     }
 }

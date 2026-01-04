@@ -209,18 +209,17 @@ impl ConversationSession {
             .count()
     }
 
-    /// Calculate a simple hash of the conversation content
+    /// Calculate a stable hash of the conversation content
+    /// Uses xxhash for cross-platform stability (same result on ARM and x86)
     pub fn content_hash(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
+        let mut combined = String::new();
         for entry in &self.entries {
             if let Ok(json) = serde_json::to_string(entry) {
-                json.hash(&mut hasher);
+                combined.push_str(&json);
+                combined.push('\n');
             }
         }
-        format!("{:x}", hasher.finish())
+        format!("{:016x}", xxhash_rust::xxh3::xxh3_64(combined.as_bytes()))
     }
 }
 

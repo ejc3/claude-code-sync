@@ -1,5 +1,6 @@
 // Module declarations
 mod discovery;
+mod history_merge;
 mod init;
 mod pull;
 mod push;
