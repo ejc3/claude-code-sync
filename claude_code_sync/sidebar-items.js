@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["VerbosityLevel"],"mod":["config","conflict","filter","history","interactive_conflict","lock","logger","merge","onboarding","parser","report","scm","sync"]};

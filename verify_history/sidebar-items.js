@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["compare_histories","main","parse_history_file"],"struct":["ComparisonStats","HistoryEntry"]};

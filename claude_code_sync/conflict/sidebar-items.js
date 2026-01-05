@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ConflictResolution","SessionRelationship"],"fn":["analyze_session_relationship"],"struct":["Conflict","ConflictDetector"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CONFIG_DIR_ENV_VAR"],"struct":["ConfigManager"]};
