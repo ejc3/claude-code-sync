@@ -1,15 +1,27 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+/// Environment variable to override the config directory location.
+/// Useful for testing and automation.
+pub const CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CODE_SYNC_CONFIG_DIR";
+
 /// Cross-platform configuration directory manager
 pub struct ConfigManager;
 
 impl ConfigManager {
-    /// Get the main configuration directory path following platform conventions:
+    /// Get the main configuration directory path.
+    ///
+    /// If `CLAUDE_CODE_SYNC_CONFIG_DIR` is set, uses that path directly.
+    /// Otherwise follows platform conventions:
     /// - Linux: $XDG_CONFIG_HOME/claude-code-sync or ~/.config/claude-code-sync
     /// - macOS: ~/Library/Application Support/claude-code-sync
     /// - Windows: %APPDATA%\claude-code-sync
     pub fn config_dir() -> Result<PathBuf> {
+        // Check for override env var first (useful for testing)
+        if let Ok(override_dir) = std::env::var(CONFIG_DIR_ENV_VAR) {
+            return Ok(PathBuf::from(override_dir));
+        }
+
         #[cfg(target_os = "linux")]
         {
             // Follow XDG Base Directory Specification

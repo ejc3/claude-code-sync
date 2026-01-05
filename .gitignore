@@ -44,3 +44,7 @@ test-backup/
 # Logs
 *.log
 *.log.*
+
+# Environment files with secrets
+.env.local
+.env*.local
