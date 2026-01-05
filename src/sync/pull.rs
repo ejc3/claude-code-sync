@@ -105,6 +105,20 @@ pub fn pull_history(
         local_session_count += 1;
     }
 
+    // Also copy history.jsonl to sync repo (session index for --resume picker)
+    let claude_base_dir = claude_dir.parent().unwrap_or(&claude_dir);
+    let local_history = claude_base_dir.join("history.jsonl");
+    let sync_history = state.sync_repo_path.join("history.jsonl");
+    if local_history.exists() {
+        // Merge local history into sync repo history (preserving remote entries)
+        let (total, added) = super::history_merge::merge_history_files(
+            &local_history,
+            &sync_history,
+            super::history_merge::MergePriority::TargetFirst,
+        )?;
+        log::debug!("Saved history.jsonl to sync repo: {} total, {} added", total, added);
+    }
+
     // Commit local state to temp branch
     repo.stage_all()?;
     if repo.has_changes()? {
